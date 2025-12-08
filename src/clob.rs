@@ -1,0 +1,1310 @@
+use std::borrow::Cow;
+use std::marker::PhantomData;
+use std::mem;
+use std::sync::Arc;
+
+use alloy::dyn_abi::Eip712Domain;
+use alloy::primitives::{Address, U256};
+use alloy::signers::Signer;
+use alloy::sol_types::SolStruct as _;
+use async_stream::try_stream;
+use chrono::{NaiveDate, Utc};
+use dashmap::DashMap;
+use derive_builder::Builder;
+use futures::Stream;
+use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::{Client as ReqwestClient, Method, Request};
+use serde::de::DeserializeOwned;
+use serde_json::json;
+use url::Url;
+
+use crate::auth::builder::Config as BuilderConfig;
+use crate::auth::{Builder, Credentials, Kind as AuthKind, Normal};
+use crate::clob::state::{Authenticated, State, Unauthenticated};
+use crate::errors::Error;
+use crate::order_builder::{Limit, Market, OrderBuilder, generate_seed};
+use crate::types::{
+    ApiKeysResponse, BalanceAllowanceRequest, BalanceAllowanceResponse, BanStatusResponse,
+    BuilderTradeResponse, CancelMarketOrderRequest, CancelOrdersResponse,
+    DeleteNotificationsRequest, FeeRateResponse, LastTradePriceRequest, LastTradePriceResponse,
+    LastTradesPricesResponse, MarketResponse, MarketRewardResponse, MarketTradeEventResponse,
+    MidpointRequest, MidpointResponse, MidpointsResponse, NegRiskResponse, NotificationResponse,
+    OpenOrderResponse, OrderBookSummaryRequest, OrderBookSummaryResponse, OrderScoringResponse,
+    OrdersRequest, OrdersScoringResponse, Page, PostOrderResponse, PriceRequest, PriceResponse,
+    PricesResponse, RewardsPercentagesResponse, SignableOrder, SignatureType, SignedOrder,
+    SimplifiedMarketResponse, SpreadRequest, SpreadResponse, SpreadsResponse, TickSize,
+    TickSizeResponse, TotalUserEarningResponse, TradeResponse, TradesRequest,
+    UpdateBalanceAllowanceRequest, UserEarningResponse, UserRewardsEarningRequest,
+    UserRewardsEarningResponse,
+};
+use crate::{Result, Timestamp, auth, contract_config};
+
+const ORDER_NAME: Option<Cow<'static, str>> = Some(Cow::Borrowed("Polymarket CTF Exchange"));
+const VERSION: Option<Cow<'static, str>> = Some(Cow::Borrowed("1"));
+
+const TERMINAL_CURSOR: &str = "LTE="; // base64("-1")
+
+/// Each [`Client`] can exist in one state at a time, i.e. [`state::Unauthenticated`] or
+/// [`state::Authenticated`].
+pub mod state {
+    use alloy::signers::Signer;
+
+    use super::AuthKind;
+    use crate::auth::Credentials;
+
+    /// The initial state of the [`super::Client`]
+    #[non_exhaustive]
+    #[derive(Clone, Debug)]
+    pub struct Unauthenticated;
+
+    /// The elevated state of the [`super::Client`]. Calling [`super::Client::authentication_builder`]
+    /// (or [`super::Client::builder_authentication_builder`] for [`super::auth::Builder`] auth)
+    /// will return an [`super::AuthenticationBuilder`], which can be turned into
+    /// an authenticated client via [`super::AuthenticationBuilder::authenticate`].
+    ///
+    /// See `examples/authenticated.rs` for more context.
+    #[non_exhaustive]
+    #[derive(Clone, Debug)]
+    pub struct Authenticated<S: Signer, K: AuthKind> {
+        /// The signer's address is used to populate the L2 headers ([`reqwest::header::HeaderMap`])
+        /// `POLY_ADDRESS` field. The signer also signs the [`super::Order`] into a
+        /// [`super::SignedOrder`] that is sent to the server.
+        pub(crate) signer: S,
+        /// The [`Credentials`]'s `secret` is used to generate an [`crate::signer::hmac`] which is
+        /// passed in the L2 headers ([`super::HeaderMap`]) `POLY_SIGNATURE` field.
+        pub(crate) credentials: Credentials,
+        /// The [`Kind`] that this [`Authenticated`] exhibits. Used to generate additional headers
+        /// for different types of authentication, e.g. Builder.
+        pub(crate) kind: K,
+    }
+
+    /// The client state can only be [`Unauthenticated`] or [`Authenticated`].
+    pub trait State: sealed::Sealed {}
+
+    impl State for Unauthenticated {}
+    impl sealed::Sealed for Unauthenticated {}
+
+    impl<S: Signer, K: AuthKind> State for Authenticated<S, K> {}
+    impl<S: Signer, K: AuthKind> sealed::Sealed for Authenticated<S, K> {}
+
+    mod sealed {
+        pub trait Sealed {}
+    }
+}
+
+/// The type used to build a request to authenticate the inner [`Client<Unauthorized>`]. Calling
+/// `authenticate` on this will elevate that inner `client` into an [`Client<Authenticated<S, K>>`].
+pub struct AuthenticationBuilder<S: Signer, K: AuthKind = Normal> {
+    /// The initially unauthenticated client that is "carried forward" into the authenticated client.
+    client: Client<Unauthenticated>,
+    /// The signer used to generate the L1 headers that will return a set of [`Credentials`].
+    signer: S,
+    /// If [`Credentials`] are supplied, then those are used instead of making new calls to obtain one.
+    credentials: Option<Credentials>,
+    /// An optional `nonce` value, when `credentials` are not present, to pass along to the call to
+    /// create or derive [`Credentials`].
+    nonce: Option<u32>,
+    /// The [`Kind`] that this [`AuthenticationBuilder`] exhibits. Used to generate additional
+    /// headers for different types of authentication, e.g. Builder.
+    kind: K,
+    /// The optional [`Address`] used to represent the funder for this `client`. If a funder is set
+    /// then `signature_type` must match `Some(SignatureType::Proxy | Signature::GnosisSafe)`. Conversely,
+    /// if funder is not set, then `signature_type` must be `Some(SignatureType::Eoa)`.
+    funder: Option<Address>,
+    /// The optional [`SignatureType`], see `funder` for more information.
+    signature_type: Option<SignatureType>,
+    /// The optional salt/seed generator for use in creating [`SignableOrder`]s
+    salt_generator: Option<fn() -> u64>,
+}
+
+impl<S: Signer, K: AuthKind> AuthenticationBuilder<S, K> {
+    #[must_use]
+    pub fn nonce(mut self, nonce: u32) -> Self {
+        self.nonce = Some(nonce);
+        self
+    }
+
+    #[must_use]
+    pub fn credentials(mut self, credentials: Credentials) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    #[must_use]
+    pub fn funder(mut self, funder: Address) -> Self {
+        self.funder = Some(funder);
+        self
+    }
+
+    #[must_use]
+    pub fn signature_type(mut self, signature_type: SignatureType) -> Self {
+        self.signature_type = Some(signature_type);
+        self
+    }
+
+    #[must_use]
+    pub fn salt_generator(mut self, salt_generator: fn() -> u64) -> Self {
+        self.salt_generator = Some(salt_generator);
+        self
+    }
+
+    /// Attempt to elevate the inner `client` to [`Client<Authenticated<S, K>>`] using the optional
+    /// fields supplied in the builder.
+    pub async fn authenticate(self) -> Result<Client<Authenticated<S, K>>> {
+        let inner = Arc::into_inner(self.client.inner).ok_or(Error::Synchronization)?;
+
+        if self.signer.chain_id().is_none() {
+            return Err(Error::Validation(
+                "Chain id not set, be sure to provide one on the signer".to_owned(),
+            ));
+        }
+
+        match (self.funder, self.signature_type) {
+            (Some(_), Some(sig @ SignatureType::Eoa)) => {
+                return Err(Error::Validation(format!(
+                    "Cannot have a funder address with a {sig} signature type"
+                )));
+            }
+            (
+                Some(Address::ZERO),
+                Some(sig @ (SignatureType::Proxy | SignatureType::GnosisSafe)),
+            ) => {
+                return Err(Error::Validation(format!(
+                    "Cannot have a zero funder address with a {sig} signature type"
+                )));
+            }
+            (None, Some(sig @ (SignatureType::Proxy | SignatureType::GnosisSafe))) => {
+                return Err(Error::Validation(format!(
+                    "Must have a funder address with a {sig} signature type"
+                )));
+            }
+            _ => {}
+        }
+
+        let credentials = match self.credentials {
+            Some(_) if self.nonce.is_some() => return Err(Error::Validation(
+                "Credentials and nonce are both set. If nonce is set, then you must not supply credentials".to_owned()
+            )),
+            Some(credentials) => credentials,
+            None => inner.create_or_derive_api_key(&self.signer, self.nonce).await?
+        };
+
+        let state = Authenticated {
+            signer: self.signer,
+            credentials,
+            kind: self.kind,
+        };
+
+        Ok(Client {
+            inner: Arc::new(ClientInner {
+                state,
+                config: inner.config,
+                host: inner.host,
+                client: inner.client,
+                tick_sizes: inner.tick_sizes,
+                neg_risk: inner.neg_risk,
+                fee_rate_bps: inner.fee_rate_bps,
+                funder: self.funder,
+                signature_type: self.signature_type.unwrap_or(SignatureType::Eoa),
+                salt_generator: self.salt_generator.unwrap_or(generate_seed),
+            }),
+        })
+    }
+}
+
+/// The main way for API users to interact with the Polymarket CLOB.
+///
+/// A [`Client`] can either be [`Unauthenticated`] or [`Authenticated`], that is, authenticated
+/// with a particular [`Signer`], `S`, and a particular [`AuthKind`], `K`. That [`AuthKind`] lets
+/// the client know if it's authenticating [`Normal`]ly or as a [`auth::Builder`].
+///
+/// Only the allowed methods will be available for use when in a particular state, i.e. only
+/// unauthenticated methods will be visible when unauthenticated, same for authenticated/builder
+/// authenticated methods.
+///
+/// [`Client`] is thread-safe
+///
+/// Create an unauthenticated client:
+/// ```rust
+/// use polymarket_client_sdk::Result;
+/// use polymarket_client_sdk::clob::{Client, Config};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<()> {
+///     let client = Client::new("https://clob.polymarket.com", Config::default())?;
+///
+///     let ok = client.ok().await?;
+///     println!("Ok: {ok}");
+///
+///     Ok(())
+/// }
+/// ```
+///
+/// Elevate into an authenticated client:
+/// ```rust,no_run
+/// use std::str::FromStr as _;
+///
+/// use alloy::signers::Signer as _;
+/// use alloy::signers::local::LocalSigner;
+/// use polymarket_client_sdk::{Result, POLYGON, PRIVATE_KEY_VAR};
+/// use polymarket_client_sdk::clob::{Client, Config};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<()> {
+///     let private_key = std::env::var(PRIVATE_KEY_VAR).expect("Need a private key");
+///     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
+///     let client = Client::new("https://clob.polymarket.com", Config::default())?
+///         .authentication_builder(signer)
+///         .authenticate()
+///         .await?;
+///
+///     let ok = client.ok().await?;
+///     println!("Ok: {ok}");
+///
+///     let api_keys = client.api_keys().await?;
+///     println!("API keys: {api_keys:?}");
+///
+///     Ok(())
+/// }
+/// ```
+#[derive(Clone, Debug)]
+pub struct Client<S: State = Unauthenticated> {
+    inner: Arc<ClientInner<S>>,
+}
+
+/// Configuration for [`Client`]
+#[derive(Clone, Debug, Default, Builder)]
+#[builder(pattern = "owned", build_fn(error = "Error"))]
+#[builder(default)]
+pub struct Config {
+    /// Whether the [`Client`] will use the server time provided by Polymarket when creating auth
+    /// headers. This adds another round trip to the requests.
+    use_server_time: bool,
+}
+
+#[derive(Debug)]
+struct ClientInner<S: State> {
+    config: Config,
+    /// The current [`State`] of this client
+    state: S,
+    /// The [`Url`] against which `client` is making requests.
+    host: Url,
+    /// The inner [`ReqwestClient`] used to make requests to `host`.
+    client: ReqwestClient,
+    /// Local cache of [`TickSize`] per token ID
+    tick_sizes: DashMap<String, TickSize>,
+    /// Local cache representing whether this token is part of a `neg_risk` market
+    neg_risk: DashMap<String, bool>,
+    /// Local cache representing the fee rate in basis points per token ID
+    fee_rate_bps: DashMap<String, u32>,
+    /// The funder for this [`ClientInner`]. If funder is present, then `signature_type` cannot
+    /// be [`SignatureType::Eoa`]. Conversely, if funder is absent, then `signature_type` cannot be
+    /// [`SignatureType::Proxy`] or [`SignatureType::GnosisSafe`].
+    funder: Option<Address>,
+    /// The signature type for this [`ClientInner`]. Defaults to [`SignatureType::Eoa`]
+    signature_type: SignatureType,
+    /// The salt/seed generator for use in creating [`SignableOrder`]s
+    salt_generator: fn() -> u64,
+}
+
+impl<S: State> ClientInner<S> {
+    async fn request<Response: DeserializeOwned>(
+        &self,
+        mut request: Request,
+        headers: Option<HeaderMap>,
+    ) -> Result<Response> {
+        let method = request.method().clone();
+        let path = request.url().path().to_owned();
+
+        if let Some(h) = headers {
+            *request.headers_mut() = h;
+        }
+
+        let response = self.client.execute(request).await?;
+        let status_code = response.status();
+
+        if !status_code.is_success() {
+            let message = response.text().await.unwrap_or_default();
+
+            return Err(Error::Status {
+                status_code,
+                method,
+                path,
+                message,
+            });
+        }
+
+        Ok(response.json().await?)
+    }
+
+    pub async fn server_time(&self) -> Result<Timestamp> {
+        let request = self
+            .client
+            .request(Method::GET, format!("{}time", self.host))
+            .build()?;
+
+        self.request(request, None).await
+    }
+}
+
+impl ClientInner<Unauthenticated> {
+    pub async fn create_api_key<S: Signer>(
+        &self,
+        signer: &S,
+        nonce: Option<u32>,
+    ) -> Result<Credentials> {
+        let request = self
+            .client
+            .request(Method::POST, format!("{}auth/api-key", self.host))
+            .build()?;
+        let headers = self.create_headers(signer, nonce).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn derive_api_key<S: Signer>(
+        &self,
+        signer: &S,
+        nonce: Option<u32>,
+    ) -> Result<Credentials> {
+        let request = self
+            .client
+            .request(Method::GET, format!("{}auth/derive-api-key", self.host))
+            .build()?;
+        let headers = self.create_headers(signer, nonce).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    async fn create_or_derive_api_key<S: Signer>(
+        &self,
+        signer: &S,
+        nonce: Option<u32>,
+    ) -> Result<Credentials> {
+        match self.create_api_key(signer, nonce).await {
+            Ok(creds) => Ok(creds),
+            Err(_) => self.derive_api_key(signer, nonce).await,
+        }
+    }
+
+    async fn create_headers<S: Signer>(&self, signer: &S, nonce: Option<u32>) -> Result<HeaderMap> {
+        let chain_id = signer.chain_id().ok_or(Error::Validation(
+            "Chain id not set, be sure to provide one on the signer".to_owned(),
+        ))?;
+
+        let timestamp = if self.config.use_server_time {
+            self.server_time().await?
+        } else {
+            Utc::now().timestamp()
+        };
+
+        auth::l1::create_headers(signer, chain_id, timestamp, nonce).await
+    }
+}
+
+impl<S: State> Client<S> {
+    #[must_use]
+    pub fn host(&self) -> &Url {
+        &self.inner.host
+    }
+
+    pub async fn ok(&self) -> Result<String> {
+        let request = self
+            .client()
+            .request(Method::GET, self.host().to_owned())
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn server_time(&self) -> Result<Timestamp> {
+        self.inner.server_time().await
+    }
+
+    pub async fn midpoint(&self, request: &MidpointRequest) -> Result<MidpointResponse> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}midpoint", self.host()))
+            .query(&[("token_id", request.token_id.as_str())])
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn midpoints(&self, requests: &[MidpointRequest]) -> Result<MidpointsResponse> {
+        let request = self
+            .client()
+            .request(Method::POST, format!("{}midpoints", self.host()))
+            .json(requests)
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn price(&self, request: &PriceRequest) -> Result<PriceResponse> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}price", self.host()))
+            .query(&[
+                ("token_id", request.token_id.as_str()),
+                ("side", &request.side.to_string()),
+            ])
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn prices(&self, requests: &[PriceRequest]) -> Result<PricesResponse> {
+        let request = self
+            .client()
+            .request(Method::POST, format!("{}prices", self.host()))
+            .json(requests)
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn spread(&self, request: &SpreadRequest) -> Result<SpreadResponse> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}spread", self.host()))
+            .query(&[("token_id", request.token_id.as_str())])
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn spreads(&self, requests: &[SpreadRequest]) -> Result<SpreadsResponse> {
+        let request = self
+            .client()
+            .request(Method::POST, format!("{}spreads", self.host()))
+            .json(requests)
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn tick_size(&self, token_id: &str) -> Result<TickSizeResponse> {
+        if let Some(tick_size) = self.inner.tick_sizes.get(token_id) {
+            return Ok(TickSizeResponse {
+                minimum_tick_size: *tick_size,
+            });
+        }
+
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}tick-size", self.host()))
+            .query(&[("token_id", token_id)])
+            .build()?;
+
+        let response = self.request::<TickSizeResponse>(request, None).await?;
+
+        self.inner
+            .tick_sizes
+            .insert(token_id.to_owned(), response.minimum_tick_size);
+
+        Ok(response)
+    }
+
+    pub async fn neg_risk(&self, token_id: &str) -> Result<NegRiskResponse> {
+        if let Some(neg_risk) = self.inner.neg_risk.get(token_id) {
+            return Ok(NegRiskResponse {
+                neg_risk: *neg_risk,
+            });
+        }
+
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}neg-risk", self.host()))
+            .query(&[("token_id", token_id)])
+            .build()?;
+
+        let response = self.request::<NegRiskResponse>(request, None).await?;
+
+        self.inner
+            .neg_risk
+            .insert(token_id.to_owned(), response.neg_risk);
+
+        Ok(response)
+    }
+
+    pub async fn fee_rate_bps(&self, token_id: &str) -> Result<FeeRateResponse> {
+        if let Some(base_fee) = self.inner.fee_rate_bps.get(token_id) {
+            return Ok(FeeRateResponse {
+                base_fee: *base_fee,
+            });
+        }
+
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}fee-rate", self.host()))
+            .query(&[("token_id", token_id)])
+            .build()?;
+
+        let response = self.request::<FeeRateResponse>(request, None).await?;
+
+        self.inner
+            .fee_rate_bps
+            .insert(token_id.to_owned(), response.base_fee);
+
+        Ok(response)
+    }
+
+    pub async fn order_book(
+        &self,
+        request: &OrderBookSummaryRequest,
+    ) -> Result<OrderBookSummaryResponse> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}book", self.host()))
+            .query(&[("token_id", request.token_id.as_str())])
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn order_books(
+        &self,
+        requests: &[OrderBookSummaryRequest],
+    ) -> Result<Vec<OrderBookSummaryResponse>> {
+        let request = self
+            .client()
+            .request(Method::POST, format!("{}books", self.host()))
+            .json(requests)
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn last_trade_price(
+        &self,
+        request: &LastTradePriceRequest,
+    ) -> Result<LastTradePriceResponse> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}last-trade-price", self.host()))
+            .query(&[("token_id", request.token_id.as_str())])
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn last_trades_prices(
+        &self,
+        token_ids: &[LastTradePriceRequest],
+    ) -> Result<Vec<LastTradesPricesResponse>> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}last-trades-prices", self.host()))
+            .json(token_ids)
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn market(&self, condition_id: &str) -> Result<MarketResponse> {
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}markets/{condition_id}", self.host()),
+            )
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn markets(&self, next_cursor: Option<String>) -> Result<Page<MarketResponse>> {
+        let cursor = next_cursor.map_or(String::new(), |c| format!("?next_cursor={c}"));
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}markets{cursor}", self.host()))
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn sampling_markets(
+        &self,
+        next_cursor: Option<String>,
+    ) -> Result<Page<MarketResponse>> {
+        let cursor = next_cursor.map_or(String::new(), |c| format!("?next_cursor={c}"));
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}sampling-markets{cursor}", self.host()),
+            )
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn simplified_markets(
+        &self,
+        next_cursor: Option<String>,
+    ) -> Result<Page<SimplifiedMarketResponse>> {
+        let cursor = next_cursor.map_or(String::new(), |c| format!("?next_cursor={c}"));
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}simplified-markets{cursor}", self.host()),
+            )
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn sampling_simplified_markets(
+        &self,
+        next_cursor: Option<String>,
+    ) -> Result<Page<SimplifiedMarketResponse>> {
+        let cursor = next_cursor.map_or(String::new(), |c| format!("?next_cursor={c}"));
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}sampling-simplified-markets{cursor}", self.host()),
+            )
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    pub async fn market_trades_events(
+        &self,
+        condition_id: &str,
+    ) -> Result<Vec<MarketTradeEventResponse>> {
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}live-activity/events/{condition_id}", self.host()),
+            )
+            .build()?;
+
+        self.request(request, None).await
+    }
+
+    /// Returns a stream of results, using `self` to repeatedly invoke the provided closure,
+    /// `call`, which takes the next cursor to query against. Each `call` returns a future
+    /// that returns a [`Page<Data>`]. Each page is flattened into the underlying data in the stream.
+    pub fn stream_data<'client, Call, Fut, Data>(
+        &'client self,
+        call: Call,
+    ) -> impl Stream<Item = Result<Data>> + 'client
+    where
+        Call: Fn(&'client Client<S>, Option<String>) -> Fut + 'client,
+        Fut: Future<Output = Result<Page<Data>>> + 'client,
+        Data: 'client,
+    {
+        try_stream! {
+            let mut cursor: Option<String> = None;
+
+            loop {
+                let page = call(self, mem::take(&mut cursor)).await?;
+
+                for item in page.data {
+                    yield item
+                }
+
+                if page.next_cursor == TERMINAL_CURSOR {
+                    break;
+                }
+
+                cursor = Some(page.next_cursor);
+            }
+        }
+    }
+
+    async fn request<Response: DeserializeOwned>(
+        &self,
+        request: Request,
+        headers: Option<HeaderMap>,
+    ) -> Result<Response> {
+        self.inner.request(request, headers).await
+    }
+
+    fn client(&self) -> &ReqwestClient {
+        &self.inner.client
+    }
+}
+
+impl Client<Unauthenticated> {
+    pub fn new(host: &str, config: Config) -> Result<Client<Unauthenticated>> {
+        let mut headers = HeaderMap::new();
+
+        headers.insert("User-Agent", HeaderValue::from_static("rs_clob_client"));
+        headers.insert("Accept", HeaderValue::from_static("*/*"));
+        headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+
+        let client = ReqwestClient::builder().default_headers(headers).build()?;
+
+        Ok(Self {
+            inner: Arc::new(ClientInner {
+                config,
+                host: Url::parse(host)?,
+                client,
+                tick_sizes: DashMap::new(),
+                neg_risk: DashMap::new(),
+                fee_rate_bps: DashMap::new(),
+                state: Unauthenticated,
+                funder: None,
+                signature_type: SignatureType::Eoa,
+                salt_generator: generate_seed,
+            }),
+        })
+    }
+
+    pub fn authentication_builder<S: Signer>(self, signer: S) -> AuthenticationBuilder<S, Normal> {
+        AuthenticationBuilder {
+            signer,
+            credentials: None,
+            nonce: None,
+            kind: Normal,
+            funder: self.inner.funder,
+            signature_type: Some(self.inner.signature_type),
+            client: self,
+            salt_generator: None,
+        }
+    }
+
+    pub fn builder_authentication_builder<S: Signer>(
+        self,
+        signer: S,
+        config: BuilderConfig,
+    ) -> AuthenticationBuilder<S, Builder> {
+        let client = self.client().clone();
+
+        AuthenticationBuilder {
+            signer,
+            credentials: None,
+            nonce: None,
+            kind: Builder { config, client },
+            funder: self.inner.funder,
+            signature_type: Some(self.inner.signature_type),
+            client: self,
+            salt_generator: None,
+        }
+    }
+
+    /// Attempts to create a new set of [`Credentials`] and returns an error if there already is one
+    /// for the particular L2 header's (signer) `address` and `nonce`.
+    pub async fn create_api_key<S: Signer>(
+        &self,
+        signer: &S,
+        nonce: Option<u32>,
+    ) -> Result<Credentials> {
+        self.inner.create_api_key(signer, nonce).await
+    }
+
+    /// Attempts to derive an existing set of [`Credentials`] and returns an error if there
+    /// are none for the particular L2 header's (signer) `address` and `nonce`.
+    pub async fn derive_api_key<S: Signer>(
+        &self,
+        signer: &S,
+        nonce: Option<u32>,
+    ) -> Result<Credentials> {
+        self.inner.derive_api_key(signer, nonce).await
+    }
+
+    /// Idempotent alternative to [`Self::create_api_key`] and [`Self::derive_api_key`], which will
+    /// either create a new set of [`Credentials`] if they do not exist already, or return them if
+    /// they do.
+    pub async fn create_or_derive_api_key<S: Signer>(
+        &self,
+        signer: &S,
+        nonce: Option<u32>,
+    ) -> Result<Credentials> {
+        self.inner.create_or_derive_api_key(signer, nonce).await
+    }
+}
+
+impl<S: Signer, K: AuthKind> Client<Authenticated<S, K>> {
+    /// Demotes this authenticated [`Client<Authenticated<S, K>>`] to an unauthenticated one
+    pub fn deauthenticate(self) -> Result<Client<Unauthenticated>> {
+        let inner = Arc::into_inner(self.inner).ok_or(Error::Synchronization)?;
+        Ok(Client::<Unauthenticated> {
+            inner: Arc::new(ClientInner {
+                state: Unauthenticated,
+                host: inner.host,
+                config: inner.config,
+                client: inner.client,
+                tick_sizes: inner.tick_sizes,
+                neg_risk: inner.neg_risk,
+                fee_rate_bps: inner.fee_rate_bps,
+                // Reset the order parameters that were previously stored on the client
+                funder: None,
+                signature_type: SignatureType::Eoa,
+                salt_generator: generate_seed,
+            }),
+        })
+    }
+
+    #[must_use]
+    pub fn state(&self) -> &Authenticated<S, K> {
+        &self.inner.state
+    }
+
+    #[must_use]
+    pub fn address(&self) -> Address {
+        self.state().signer.address()
+    }
+
+    /// Return all API keys associated with the address corresponding to the inner signer in
+    /// [`Authenticated<S, K>`].
+    pub async fn api_keys(&self) -> Result<ApiKeysResponse> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}auth/api-keys", self.host()))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn delete_api_key(&self) -> Result<serde_json::Value> {
+        let request = self
+            .client()
+            .request(Method::DELETE, format!("{}auth/api-key", self.host()))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn closed_only_mode(&self) -> Result<BanStatusResponse> {
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}auth/ban-status/closed-only", self.host()),
+            )
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    /// Creates an [`OrderBuilder<S, Limit, K>`] used to construct a limit order.
+    #[must_use]
+    pub fn limit_order(&self) -> OrderBuilder<S, Limit, K> {
+        self.order_builder()
+    }
+
+    /// Creates an [`OrderBuilder<S, Market, K>`] used to construct a market order.
+    #[must_use]
+    pub fn market_order(&self) -> OrderBuilder<S, Market, K> {
+        self.order_builder()
+    }
+
+    /// Attempts to sign the provided [`SignableOrder`] using the inner signer of [`Authenticated<S, K>`]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "No need to publicly document as we are guarded by the typestate pattern. \
+        We cannot call `sign` without first calling `authenticate`"
+    )]
+    pub async fn sign(
+        &self,
+        SignableOrder { order, order_type }: SignableOrder,
+    ) -> Result<SignedOrder> {
+        let token_id = order.tokenId.to_string();
+        let neg_risk = self.neg_risk(&token_id).await?.neg_risk;
+        let chain_id = self
+            .state()
+            .signer
+            .chain_id()
+            .expect("Validated not none in `authenticate`");
+
+        let exchange_contract = contract_config(chain_id, neg_risk)
+            .ok_or(Error::MissingContractConfig(chain_id, neg_risk))?
+            .exchange;
+
+        let domain = Eip712Domain {
+            name: ORDER_NAME,
+            version: VERSION,
+            chain_id: Some(U256::from(chain_id)),
+            verifying_contract: Some(exchange_contract),
+            ..Eip712Domain::default()
+        };
+
+        let signature = self
+            .state()
+            .signer
+            .sign_hash(&order.eip712_signing_hash(&domain))
+            .await?;
+
+        Ok(SignedOrder {
+            order,
+            signature,
+            order_type,
+            owner: self.state().credentials.key,
+        })
+    }
+
+    pub async fn post_order(&self, order: SignedOrder) -> Result<Vec<PostOrderResponse>> {
+        self.post_orders(vec![order]).await
+    }
+
+    pub async fn post_orders(&self, orders: Vec<SignedOrder>) -> Result<Vec<PostOrderResponse>> {
+        let request = self
+            .client()
+            .request(Method::POST, format!("{}orders", self.host()))
+            .json(&orders)
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    /// Attempts to return the corresponding order at the provided `order_id`
+    pub async fn order(&self, order_id: &str) -> Result<OpenOrderResponse> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}data/order/{order_id}", self.host()))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn orders(
+        &self,
+        request: &OrdersRequest,
+        next_cursor: Option<String>,
+    ) -> Result<Page<OpenOrderResponse>> {
+        let params = request.as_params(next_cursor.as_ref());
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}data/orders{params}", self.host()))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn cancel_order(&self, order_id: &str) -> Result<CancelOrdersResponse> {
+        let request = self
+            .client()
+            .request(Method::DELETE, format!("{}order", self.host()))
+            .json(&json!({ "orderId": order_id }))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn cancel_orders(&self, order_ids: &[&str]) -> Result<CancelOrdersResponse> {
+        let request = self
+            .client()
+            .request(Method::DELETE, format!("{}orders", self.host()))
+            .json(&json!(order_ids))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn cancel_all_orders(&self) -> Result<CancelOrdersResponse> {
+        let request = self
+            .client()
+            .request(Method::DELETE, format!("{}cancel-all", self.host()))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    /// Attempts to cancel all open orders for a particular [`CancelMarketOrderRequest::market`]
+    /// and/or [`CancelMarketOrderRequest::asset_id`]
+    pub async fn cancel_market_orders(
+        &self,
+        request: &CancelMarketOrderRequest,
+    ) -> Result<CancelOrdersResponse> {
+        let request = self
+            .client()
+            .request(
+                Method::DELETE,
+                format!("{}cancel-market-orders", self.host()),
+            )
+            .json(&request)
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn trades(
+        &self,
+        request: &TradesRequest,
+        next_cursor: Option<String>,
+    ) -> Result<Page<TradeResponse>> {
+        let params = request.as_params(next_cursor.as_ref());
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}data/trades{params}", self.host()))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn notifications(&self) -> Result<Vec<NotificationResponse>> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}notifications", self.host()))
+            .query(&[("signature_type", self.inner.signature_type as u8)])
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn delete_notifications(&self, request: &DeleteNotificationsRequest) -> Result<()> {
+        let params = request.as_params();
+        let request = self
+            .client()
+            .request(
+                Method::DELETE,
+                format!("{}notifications{params}", self.host()),
+            )
+            .json(&request)
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn balance_allowance(
+        &self,
+        request: &BalanceAllowanceRequest,
+    ) -> Result<BalanceAllowanceResponse> {
+        let params = request.as_params(self.inner.signature_type);
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}balance-allowance{params}", self.host()),
+            )
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn update_balance_allowance(
+        &self,
+        request: &UpdateBalanceAllowanceRequest,
+    ) -> Result<()> {
+        let params = request.as_params(self.inner.signature_type);
+        let mut request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}balance-allowance/update{params}", self.host()),
+            )
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        *request.headers_mut() = headers;
+
+        // We have to send the request separately from `self.request` because this endpoint does
+        // not return anything in the response body. Otherwise, we would get a EOF error from reqwest
+        self.client().execute(request).await?;
+
+        Ok(())
+    }
+
+    pub async fn is_order_scoring(&self, order_id: &str) -> Result<OrderScoringResponse> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}order-scoring", self.host()))
+            .query(&[("order_id", order_id)])
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn are_orders_scoring(&self, order_ids: &[&str]) -> Result<OrdersScoringResponse> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}orders-scoring", self.host()))
+            .json(&order_ids)
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn earnings_for_user_for_day(
+        &self,
+        date: NaiveDate,
+        next_cursor: Option<String>,
+    ) -> Result<Page<UserEarningResponse>> {
+        let cursor = next_cursor.map_or(String::new(), |c| format!("&next_cursor={c}"));
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}rewards/user{cursor}", self.host()))
+            .query(&[
+                ("date", date.to_string()),
+                (
+                    "signature_type",
+                    (self.inner.signature_type as u8).to_string(),
+                ),
+            ])
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn total_earnings_for_user_for_day(
+        &self,
+        date: NaiveDate,
+    ) -> Result<Vec<TotalUserEarningResponse>> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}rewards/user/total", self.host()))
+            .query(&[
+                ("date", date.to_string()),
+                (
+                    "signature_type",
+                    (self.inner.signature_type as u8).to_string(),
+                ),
+            ])
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn user_earnings_and_markets_config(
+        &self,
+        request: &UserRewardsEarningRequest,
+        next_cursor: Option<String>,
+    ) -> Result<Page<UserRewardsEarningResponse>> {
+        let params = request.as_params(next_cursor.as_ref());
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}rewards/user/total{params}", self.host()),
+            )
+            .query(&[(
+                "signature_type",
+                (self.inner.signature_type as u8).to_string(),
+            )])
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn reward_percentages(&self) -> Result<RewardsPercentagesResponse> {
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}rewards/user/percentages", self.host()),
+            )
+            .query(&[(
+                "signature_type",
+                (self.inner.signature_type as u8).to_string(),
+            )])
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn current_rewards(
+        &self,
+        next_cursor: Option<String>,
+    ) -> Result<Page<MarketRewardResponse>> {
+        let cursor = next_cursor.map_or(String::new(), |c| format!("&next_cursor={c}"));
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}rewards/markets/current{cursor}", self.host()),
+            )
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    pub async fn raw_rewards_for_market(
+        &self,
+        condition_id: &str,
+        next_cursor: Option<String>,
+    ) -> Result<Page<MarketRewardResponse>> {
+        let cursor = next_cursor.map_or(String::new(), |c| format!("?next_cursor={c}"));
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}rewards/markets/{condition_id}{cursor}", self.host()),
+            )
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+
+    async fn create_headers(&self, request: &Request) -> Result<HeaderMap> {
+        let timestamp = if self.inner.config.use_server_time {
+            self.server_time().await?
+        } else {
+            Utc::now().timestamp()
+        };
+
+        auth::l2::create_headers(self.state(), request, timestamp).await
+    }
+
+    fn order_builder<OrderKind>(&self) -> OrderBuilder<S, OrderKind, K> {
+        OrderBuilder {
+            signer: self.address(),
+            signature_type: self.inner.signature_type,
+            funder: self.inner.funder,
+            salt_generator: self.inner.salt_generator,
+            token_id: None,
+            price: None,
+            size: None,
+            amount: None,
+            side: None,
+            nonce: None,
+            expiration: None,
+            taker: None,
+            order_type: None,
+            client: Client {
+                inner: Arc::clone(&self.inner),
+            },
+            _kind: PhantomData,
+        }
+    }
+}
+
+impl<S: Signer> Client<Authenticated<S, Builder>> {
+    pub async fn builder_trades(
+        &self,
+        request: &TradesRequest,
+        next_cursor: Option<String>,
+    ) -> Result<Page<BuilderTradeResponse>> {
+        let params = request.as_params(next_cursor.as_ref());
+
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}builder/trades{params}", self.host()),
+            )
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        self.request(request, Some(headers)).await
+    }
+}

@@ -1,0 +1,445 @@
+use std::marker::PhantomData;
+use std::str::FromStr as _;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use alloy::primitives::{Address, U256};
+use alloy::signers::Signer;
+use chrono::{DateTime, Utc};
+use rand::Rng as _;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive as _;
+
+use crate::Result;
+use crate::auth::Kind as AuthKind;
+use crate::clob::Client;
+use crate::clob::state::Authenticated;
+use crate::errors::Error;
+use crate::types::{
+    Amount, AmountInner, Order, OrderBookSummaryRequest, OrderType, Side, SignableOrder,
+    SignatureType,
+};
+
+const USDC_DECIMALS: u32 = 6;
+pub(crate) const LOT_SIZE: u32 = 2;
+
+/// Placeholder type for compile-time checks on limit order builders
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct Limit;
+
+/// Placeholder type for compile-time checks on market order builders
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct Market;
+
+/// Used to create an order iteratively and ensure validity with respect to its order kind.
+#[derive(Debug)]
+pub struct OrderBuilder<S: Signer, OrderKind, K: AuthKind> {
+    pub(crate) client: Client<Authenticated<S, K>>,
+    pub(crate) signer: Address,
+    pub(crate) signature_type: SignatureType,
+    pub(crate) salt_generator: fn() -> u64,
+    pub(crate) token_id: Option<String>,
+    pub(crate) price: Option<Decimal>,
+    pub(crate) size: Option<Decimal>,
+    pub(crate) amount: Option<Amount>,
+    pub(crate) side: Option<Side>,
+    pub(crate) nonce: Option<u64>,
+    pub(crate) expiration: Option<DateTime<Utc>>,
+    pub(crate) taker: Option<Address>,
+    pub(crate) order_type: Option<OrderType>,
+    pub(crate) funder: Option<Address>,
+    pub(crate) _kind: PhantomData<OrderKind>,
+}
+
+impl<S: Signer, OrderKind, K: AuthKind> OrderBuilder<S, OrderKind, K> {
+    /// Sets the `token_id` for this builder. This is a required field.
+    #[must_use]
+    pub fn token_id<ID: Into<String>>(mut self, token_id: ID) -> Self {
+        self.token_id = Some(token_id.into());
+        self
+    }
+
+    /// Sets the [`Side`] for this builder. This is a required field.
+    #[must_use]
+    pub fn side(mut self, side: Side) -> Self {
+        self.side = Some(side);
+        self
+    }
+
+    /// Sets the [`Side`] for this builder.
+    #[must_use]
+    pub fn nonce(mut self, nonce: u64) -> Self {
+        self.nonce = Some(nonce);
+        self
+    }
+
+    #[must_use]
+    pub fn expiration(mut self, expiration: DateTime<Utc>) -> Self {
+        self.expiration = Some(expiration);
+        self
+    }
+
+    #[must_use]
+    pub fn taker(mut self, taker: Address) -> Self {
+        self.taker = Some(taker);
+        self
+    }
+
+    #[must_use]
+    pub fn order_type(mut self, order_type: OrderType) -> Self {
+        self.order_type = Some(order_type);
+        self
+    }
+}
+
+impl<S: Signer, K: AuthKind> OrderBuilder<S, Limit, K> {
+    /// Sets the price for this limit builder. This is a required field.
+    #[must_use]
+    pub fn price(mut self, price: Decimal) -> Self {
+        self.price = Some(price);
+        self
+    }
+
+    /// Sets the size for this limit builder. This is a required field.
+    #[must_use]
+    pub fn size(mut self, size: Decimal) -> Self {
+        self.size = Some(size);
+        self
+    }
+
+    /// Validates and transforms this limit builder into a [`SignableOrder`]
+    pub async fn build(self) -> Result<SignableOrder> {
+        let Some(token_id) = self.token_id.clone() else {
+            return Err(Error::Validation(
+                "Unable to build Order due to missing token ID".to_owned(),
+            ));
+        };
+
+        let Some(side) = self.side else {
+            return Err(Error::Validation(
+                "Unable to build Order due to missing token side".to_owned(),
+            ));
+        };
+
+        let Some(price) = self.price else {
+            return Err(Error::Validation(
+                "Unable to build Order due to missing price".to_owned(),
+            ));
+        };
+
+        if price.is_sign_negative() {
+            return Err(Error::Validation(format!(
+                "Unable to build Order due to negative price {price}"
+            )));
+        }
+
+        let fee_rate = self.client.fee_rate_bps(&token_id).await?;
+        let minimum_tick_size = self
+            .client
+            .tick_size(&token_id)
+            .await?
+            .minimum_tick_size
+            .as_decimal();
+
+        if price.scale() > minimum_tick_size.scale() {
+            return Err(Error::Validation(format!(
+                "Unable to build Order: Price {price} has {} decimal places. Minimum tick size \
+                {minimum_tick_size} has {} decimal places. Price decimal places <= minimum tick size decimal places",
+                price.scale(),
+                minimum_tick_size.scale()
+            )));
+        }
+
+        if price < minimum_tick_size || price > Decimal::ONE - minimum_tick_size {
+            return Err(Error::Validation(format!(
+                "Price {price} is too small or too large for the minimum tick size {minimum_tick_size}"
+            )));
+        }
+
+        let Some(size) = self.size else {
+            return Err(Error::Validation(
+                "Unable to build Order due to missing size".to_owned(),
+            ));
+        };
+
+        if size.scale() > LOT_SIZE {
+            return Err(Error::Validation(format!(
+                "Unable to build Order: Size {size} has {} decimal places. Maximum step size is {LOT_SIZE}",
+                size.scale()
+            )));
+        }
+
+        if size.is_zero() || size.is_sign_negative() {
+            return Err(Error::Validation(format!(
+                "Unable to build Order due to negative size {size}"
+            )));
+        }
+
+        let nonce = self.nonce.unwrap_or(0);
+        let expiration = self.expiration.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+        let taker = self.taker.unwrap_or(Address::ZERO);
+        let order_type = self.order_type.unwrap_or(OrderType::GTC);
+
+        if !matches!(order_type, OrderType::GTD) && expiration > DateTime::<Utc>::UNIX_EPOCH {
+            return Err(Error::Validation(
+                "Only GTD orders may have a non-zero expiration".to_owned(),
+            ));
+        }
+
+        // When [`Side::Buy`]ing `YES` tokens, the user will "make" `size` * `price` USDC and "take"
+        // `size` `YES` tokens, and vice versa for [`Side::Sell`]. The returned values are quantized
+        // to [`USDC_DECIMALS`].
+        //
+        // e.g. User submits a [`Limit`] order to [`Side::BUY`] 100 `YES` tokens at $0.34.
+        // This means they will take/receive 100 `YES` tokens, make/give up 34 USDC. This means that
+        // the `taker_amount` is `100000000` and the `maker_amount` of `34000000`.
+        let (taker_amount, maker_amount) = match side {
+            Side::Buy => (size, size * price),
+            Side::Sell => (size * price, size),
+            Side::Unknown => return Err(Error::Validation("Unknown side".to_owned())),
+        };
+
+        let order = Order {
+            salt: U256::from((self.salt_generator)()),
+            maker: self.funder.unwrap_or(self.signer),
+            taker,
+            tokenId: U256::from_str(&token_id)?,
+            makerAmount: U256::from(to_fixed_u128(maker_amount)),
+            takerAmount: U256::from(to_fixed_u128(taker_amount)),
+            side: side as u8,
+            feeRateBps: U256::from(fee_rate.base_fee),
+            nonce: U256::from(nonce),
+            signer: self.signer,
+            expiration: U256::from(expiration.timestamp().to_u64().ok_or(Error::Validation(
+                format!("Unable to represent expiration {expiration} as a u64"),
+            ))?),
+            signatureType: self.signature_type as u8,
+        };
+
+        Ok(SignableOrder { order, order_type })
+    }
+}
+
+impl<S: Signer, K: AuthKind> OrderBuilder<S, Market, K> {
+    /// Sets the [`Amount`] for this market order. This is a required field.
+    #[must_use]
+    pub fn amount(mut self, amount: Amount) -> Self {
+        self.amount = Some(amount);
+        self
+    }
+
+    // Attempts to calculate the market price from the top of the book for the particular token.
+    async fn calculate_price(&self, order_type: OrderType) -> Result<Decimal> {
+        let token_id = self
+            .token_id
+            .as_ref()
+            .expect("Token ID was already validated in `build`");
+        let side = self.side.expect("Side was already validated in `build`");
+        let amount = self
+            .amount
+            .as_ref()
+            .expect("Amount was already validated in `build`");
+
+        let book = self
+            .client
+            .order_book(&OrderBookSummaryRequest {
+                token_id: token_id.to_owned(),
+            })
+            .await?;
+
+        if !matches!(order_type, OrderType::FAK | OrderType::FOK) {
+            return Err(Error::Validation(
+                "Cannot set an order type other than FAK/FOK for a market order".to_owned(),
+            ));
+        }
+
+        let (levels, amount) = match (side, amount.0) {
+            (Side::Buy, a @ AmountInner::Usdc(_)) => (book.asks, a),
+            (Side::Sell, a @ AmountInner::Shares(_)) => (book.bids, a),
+            (Side::Buy, AmountInner::Shares(_)) => {
+                return Err(Error::Validation(
+                    "Buy Orders must specify their `amount`s in terms of USDC".to_owned(),
+                ));
+            }
+            (Side::Sell, AmountInner::Usdc(_)) => {
+                return Err(Error::Validation(
+                    "Sell Orders must specify their `amount`s in shares".to_owned(),
+                ));
+            }
+            (Side::Unknown, _) => return Err(Error::Validation("Unknown side".to_owned())),
+        };
+
+        if levels.is_empty() {
+            return Err(Error::Validation(format!(
+                "No opposing orders for {token_id} which means there is no market price"
+            )));
+        }
+
+        let mut sum = Decimal::ZERO;
+        let cutoff_price = levels.iter().rev().find_map(|level| {
+            match amount {
+                AmountInner::Usdc(_) => sum += level.size * level.price,
+                AmountInner::Shares(_) => sum += level.size,
+            }
+            (sum >= amount.as_inner()).then_some(level.price)
+        });
+
+        match cutoff_price {
+            Some(price) => Ok(price),
+            None if matches!(order_type, OrderType::FOK) => Err(Error::Validation(format!(
+                "Insufficient liquidity to fill order for {token_id} at {}",
+                amount.as_inner()
+            ))),
+            None => Ok(levels[0].price),
+        }
+    }
+
+    /// Validates and transforms this limit builder into a [`SignableOrder`]
+    pub async fn build(self) -> Result<SignableOrder> {
+        let Some(token_id) = self.token_id.clone() else {
+            return Err(Error::Validation(
+                "Unable to build Order due to missing token ID".to_owned(),
+            ));
+        };
+
+        let Some(side) = self.side else {
+            return Err(Error::Validation(
+                "Unable to build Order due to missing token side".to_owned(),
+            ));
+        };
+
+        let amount = self.amount.ok_or_else(|| {
+            Error::Validation("Unable to build Order due to missing amount".to_owned())
+        })?;
+
+        let nonce = self.nonce.unwrap_or(0);
+        let taker = self.taker.unwrap_or(Address::ZERO);
+
+        if let Some(price) = self.price {
+            return Err(Error::Validation(format!(
+                "Unable to build Order due to supplied price {price}"
+            )));
+        }
+
+        let order_type = self.order_type.unwrap_or(OrderType::FAK);
+        let price = self.calculate_price(order_type).await?;
+
+        let minimum_tick_size = self
+            .client
+            .tick_size(&token_id)
+            .await?
+            .minimum_tick_size
+            .as_decimal();
+        let fee_rate = self.client.fee_rate_bps(&token_id).await?;
+
+        let decimals = minimum_tick_size.scale();
+
+        // Ensure that the market price returned internally is truncated to our tick size
+        let price = price.trunc_with_scale(decimals);
+        if price < minimum_tick_size || price > Decimal::ONE - minimum_tick_size {
+            return Err(Error::Validation(format!(
+                "Price {price} is too small or too large for the minimum tick size {minimum_tick_size}"
+            )));
+        }
+
+        // When buying `YES` tokens, the user will "make" [`Amount::USDC`] dollars and "take"
+        // [`Amount::USDC`] / `price` `YES` tokens.
+        //
+        // e.g. User submits a [`kind::Market`] order to [`Side::BUY`] $100 worth of `YES` tokens at
+        // the current `market_price` of $0.34. This means they will take/receive (100/0.34)
+        // 294.117647 `YES` tokens, make/give up $100. This means that the `taker_amount` is `294117647`
+        // and the `maker_amount` of `100000000`.
+        //
+        // e.g. User submits a [`kind::Market`] order to [`Side::Sell`] 100 `YES` tokens at the current
+        // `market_price` of $0.34. This means that they will take/receive $34, make/give up 100 `YES` tokens.
+        // This means that the `taker_amount` is `34000000` and the `maker_amount` is `100000000`.
+        let (taker_amount, maker_amount) = match side {
+            Side::Buy => {
+                let raw_amount = amount.as_inner().trunc_with_scale(USDC_DECIMALS);
+                (
+                    (raw_amount / price).trunc_with_scale(USDC_DECIMALS),
+                    raw_amount,
+                )
+            }
+            Side::Sell => {
+                let raw_amount = amount.as_inner().trunc_with_scale(LOT_SIZE);
+                // Product is guaranteed to be at most `USDC` decimals already
+                (raw_amount * price, raw_amount)
+            }
+            Side::Unknown => return Err(Error::Validation("Unknown side".to_owned())),
+        };
+
+        let order = Order {
+            salt: U256::from((self.salt_generator)()),
+            maker: self.funder.unwrap_or(self.signer),
+            taker,
+            tokenId: U256::from_str(&token_id)?,
+            makerAmount: U256::from(to_fixed_u128(maker_amount)),
+            takerAmount: U256::from(to_fixed_u128(taker_amount)),
+            side: side as u8,
+            feeRateBps: U256::from(fee_rate.base_fee),
+            nonce: U256::from(nonce),
+            signer: self.signer,
+            expiration: U256::ZERO,
+            signatureType: self.signature_type as u8,
+        };
+
+        Ok(SignableOrder { order, order_type })
+    }
+}
+
+/// Removes trailing zeros, truncates to [`USDC_DECIMALS`] decimal places, and quanitizes as an
+/// integer.
+fn to_fixed_u128(d: Decimal) -> u128 {
+    d.normalize()
+        .trunc_with_scale(USDC_DECIMALS)
+        .mantissa()
+        .to_u128()
+        .expect("The `build` call in `OrderBuilder<S, OrderKind, K>` ensures that only positive values are being multiplied/divided")
+}
+
+#[must_use]
+#[expect(
+    clippy::float_arithmetic,
+    reason = "We are not concerned with precision for the seed"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "We are not concerned with truncation for a seed"
+)]
+#[expect(clippy::cast_sign_loss, reason = "We only need positive integers")]
+pub(crate) fn generate_seed() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time went backwards");
+
+    let seconds = now.as_secs_f64();
+    let rand = rand::rng().random::<f64>();
+
+    (seconds * rand).round() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    #[test]
+    fn to_fixed_u128_should_succeed() {
+        assert_eq!(to_fixed_u128(dec!(123.456)), 123_456_000);
+        assert_eq!(to_fixed_u128(dec!(123.456789)), 123_456_789);
+        assert_eq!(to_fixed_u128(dec!(123.456789111111111)), 123_456_789);
+        assert_eq!(to_fixed_u128(dec!(3.456789111111111)), 3_456_789);
+        assert_eq!(to_fixed_u128(Decimal::ZERO), 0);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "The `build` call in `OrderBuilder<S, OrderKind, K>` ensures that only positive values are being multiplied/divided"
+    )]
+    fn to_fixed_u128_panics() {
+        to_fixed_u128(dec!(-123.456));
+    }
+}

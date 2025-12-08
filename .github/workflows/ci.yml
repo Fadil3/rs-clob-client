@@ -1,0 +1,60 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ${{ matrix.os }}-latest
+    strategy:
+      matrix:
+        os: [ ubuntu, macos, windows ]
+
+    steps:
+      - uses: actions/checkout@v6
+      - run: cargo build --all-targets --all-features
+      - run: cargo test
+
+  fmt-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e
+        with:
+          components: clippy
+          toolchain: '1.88'
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e
+        with:
+          components: rustfmt
+          toolchain: 'nightly-2025-11-24'
+
+      - name: Rustfmt (nightly)
+        # Run nightly formatting to allow group imports
+        run: cargo +nightly-2025-11-24 fmt --all -- --check
+
+      - name: Clippy
+        run: cargo +1.88 clippy --all-targets --all-features -- -D warnings
+
+  cargo-sort:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install cargo-sort
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: 'cargo-sort'
+          version: 'v2.0.2'
+
+      - name: Check Cargo.toml sorting
+        run: cargo sort --check
