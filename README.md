@@ -67,7 +67,7 @@ use polymarket_client_sdk::Result;
 use polymarket_client_sdk::clob::{Client, Config};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     let client = Client::new("https://clob.polymarket.com", Config::default())?;
 
     let ok = client.ok().await?;
@@ -89,11 +89,11 @@ use std::str::FromStr as _;
 
 use alloy::signers::Signer as _;
 use alloy::signers::local::LocalSigner;
-use polymarket_client_sdk::{Result, POLYGON, PRIVATE_KEY_VAR};
+use polymarket_client_sdk::{POLYGON, PRIVATE_KEY_VAR};
 use polymarket_client_sdk::clob::{Client, Config};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     let private_key = std::env::var(PRIVATE_KEY_VAR).expect("Need a private key");
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
     let client = Client::new("https://clob.polymarket.com", Config::default())?
@@ -144,13 +144,13 @@ use std::str::FromStr as _;
 
 use alloy::signers::Signer as _;
 use alloy::signers::local::LocalSigner;
-use polymarket_client_sdk::{Result, POLYGON, PRIVATE_KEY_VAR};
+use polymarket_client_sdk::{POLYGON, PRIVATE_KEY_VAR};
 use polymarket_client_sdk::clob::{Client, Config};
 use polymarket_client_sdk::types::{Amount, OrderType, Side};
 use rust_decimal::Decimal;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     let private_key = std::env::var(PRIVATE_KEY_VAR).expect("Need a private key");
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
     let client = Client::new("https://clob.polymarket.com", Config::default())?
@@ -180,14 +180,14 @@ use std::str::FromStr as _;
 
 use alloy::signers::Signer as _;
 use alloy::signers::local::LocalSigner;
-use polymarket_client_sdk::{Result, POLYGON, PRIVATE_KEY_VAR};
+use polymarket_client_sdk::{POLYGON, PRIVATE_KEY_VAR};
 use polymarket_client_sdk::clob::{Client, Config};
 use polymarket_client_sdk::types::{Amount, OrderType, Side};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     let private_key = std::env::var(PRIVATE_KEY_VAR).expect("Need a private key");
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
     let client = Client::new("https://clob.polymarket.com", Config::default())?
@@ -220,12 +220,12 @@ use alloy::primitives::{Address, address};
 use alloy::signers::Signer as _;
 use alloy::signers::local::LocalSigner;
 use polymarket_client_sdk::auth::builder::Config as BuilderConfig;
-use polymarket_client_sdk::{Result, POLYGON, PRIVATE_KEY_VAR};
+use polymarket_client_sdk::{POLYGON, PRIVATE_KEY_VAR};
 use polymarket_client_sdk::clob::{Client, Config};
 use polymarket_client_sdk::types::{SignatureType, TradesRequest};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     let private_key = std::env::var(PRIVATE_KEY_VAR).expect("Need a private key");
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
     let builder_config = BuilderConfig::remote("http://localhost:3000/sign", None)?; // Or your signing server
