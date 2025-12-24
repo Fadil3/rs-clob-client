@@ -79,7 +79,7 @@ out/
 .venv/
 lib/
 include/
-bin/
+/bin/
 pyvenv.cfg
 
 # mpeltonen/sbt-idea plugin
