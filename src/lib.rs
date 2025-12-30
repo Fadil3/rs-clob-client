@@ -1,6 +1,8 @@
 #![cfg_attr(doc, doc = include_str!("../README.md"))]
 
 pub mod auth;
+#[cfg(feature = "bridge")]
+pub mod bridge;
 pub mod clob;
 #[cfg(feature = "data")]
 pub mod data;
