@@ -7,7 +7,7 @@ use anyhow::Context;
 use futures::{stream, StreamExt};
 use polymarket_client_sdk::clob::types::{
     MarketResponse, OrderBookSummaryRequest, OrderBookSummaryRequestBuilder, 
-    BalanceAllowanceRequest
+    BalanceAllowanceRequest, OrderType, Side
 };
 use polymarket_client_sdk::clob::Client;
 use polymarket_client_sdk::auth::state::Authenticated;
@@ -81,13 +81,18 @@ impl<'a> LogEntry<'a> {
 // Main Loop
 // ----------------------------------------------------------------------------
 
+
+// ----------------------------------------------------------------------------
+// Main Loop
+// ----------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 0. Load .env
     dotenvy::dotenv().ok();
 
     // 1. Setup Logging
-    log_json(LogEntry::info("Starting Polybot-rs (Execution Phase)..."));
+    log_json(LogEntry::info("Starting Polybot-rs (Phase 3: Observability)..."));
 
     // 1. Load Private Key & Auth
     let mut private_key = env::var(PRIVATE_KEY_VAR).context("POLYMARKET_PRIVATE_KEY not set")?;
@@ -117,16 +122,64 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => log_json(LogEntry::error("Failed to fetch balance", e)),
     }
 
+    // Stats Tracking
+    let mut total_scanned_groups = 0;
+    let mut loops = 0;
+    let start_time = std::time::Instant::now();
+
+    // -----------------------------------------------------------------------
+    // Phase 4: WebSocket Integration
+    // -----------------------------------------------------------------------
+    let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(100);
+    
+    // We need to know WHICH markets to subscribe to.
+    // Strategy:
+    // 1. Run ONE initial HTTP scan to find active NegRisk markets.
+    // 2. Subscribe to those assets.
+    // 3. Main loop waits for WS events OR scan interval.
+
+    log_json(LogEntry::info("Initial Scan to find assets for WebSocket..."));
+    let initial_markets = find_active_negrisk_markets(&client).await?;
+    let mut assets_to_track = Vec::new();
+    for m in &initial_markets {
+        for t in &m.tokens {
+            assets_to_track.push(t.token_id.clone());
+        }
+    }
+    log_json(LogEntry::info(&format!("Subscribing to {} assets via WebSocket...", assets_to_track.len())));
+
     let client = Arc::new(client);
 
-    loop {
-        match run_scan_cycle(client.clone()).await {
-            Ok(_) => {},
-            Err(e) => log_json(LogEntry::error("Scan cycle failed", e)),
+    // Spawn WS Task
+    tokio::spawn(async move {
+        if let Err(e) = polymarket_client_sdk::websocket::connect_and_listen(assets_to_track, ws_tx).await {
+            eprintln!("WebSocket Task Error: {}", e);
         }
+    });
 
-        log_json(LogEntry::info(&format!("Sleeping for {}s...", SCAN_INTERVAL_SECS)));
-        sleep(Duration::from_secs(SCAN_INTERVAL_SECS)).await;
+    loop {
+        loops += 1;
+        
+        // Select! allows us to wait for EITHER a WS message OR the timer.
+        // But for now, let's keep the existing loop logic AND check for WS messages.
+        // Actually, to fully event-drive requires refactoring `run_scan_cycle`.
+        // Hybrid Approach:
+        // - Consume all available WS messages (non-blocking) to update local cache?
+        // - OR: Just log WS messages to prove it works for now.
+        
+
+        // Poll for WS messages frequently while waiting for next scan
+        let sleep_duration = Duration::from_secs(SCAN_INTERVAL_SECS);
+        let start_sleep = std::time::Instant::now();
+        
+        log_json(LogEntry::info(&format!("Listening for WS events (sleeping {}s)...", SCAN_INTERVAL_SECS)));
+
+        while start_sleep.elapsed() < sleep_duration {
+            while let Ok(msg) = ws_rx.try_recv() {
+                 log_json(LogEntry::info(&format!("WS EVENT: {}", msg)));
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -134,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
 // Core Logic
 // ----------------------------------------------------------------------------
 
-async fn run_scan_cycle(client: Arc<Client<Authenticated<Normal>>>) -> anyhow::Result<()> {
+async fn run_scan_cycle(client: Arc<Client<Authenticated<Normal>>>) -> anyhow::Result<usize> {
     log_json(LogEntry::info("Starting market scan..."));
 
     // 1. Scan for Active Negative Risk Markets
@@ -158,7 +211,7 @@ async fn run_scan_cycle(client: Arc<Client<Authenticated<Normal>>>) -> anyhow::R
         })
         .await;
 
-    Ok(())
+    Ok(count)
 }
 
 async fn find_active_negrisk_markets(client: &Client<Authenticated<Normal>>) -> anyhow::Result<Vec<MarketResponse>> {
@@ -185,23 +238,12 @@ async fn find_active_negrisk_markets(client: &Client<Authenticated<Normal>>) -> 
     Ok(all_markets)
 }
 
-async fn process_all_groups(client: Arc<Client<Authenticated<Normal>>>, groups: Vec<MarketGroup>) {
-    // Convert groups to a stream for concurrent processing
-    stream::iter(groups)
-        .for_each_concurrent(MAX_CONCURRENT_REQUESTS, |mut group| {
-            let client = client.clone();
-            async move {
-                if let Err(e) = fetch_prices_and_calc(&client, &mut group).await {
-                    log_json(LogEntry::error("Failed to process group", e));
-                }
-            }
-        })
-        .await;
-}
 
 const MIN_LIQUIDITY: Decimal = dec!(5.0); // Minimum 5 shares to count as valid price
 const NEAR_MISS_THRESHOLD: Decimal = dec!(1.05);
 const SIMULATED_BALANCE: Decimal = dec!(20.0); // User's hypothetical deposit
+const LIVE_TRADING_ENABLED: bool = false; // SAFETY SWITCH
+const MAX_SPEND: Decimal = dec!(5.0); // Max spend per trade cycle
 
 async fn fetch_prices_and_calc(client: &Client<Authenticated<Normal>>, group: &mut MarketGroup) -> anyhow::Result<()> {
     // Prepare requests (using OrderBooks to get Size/Liquidity)
@@ -276,10 +318,21 @@ const MAX_SPREAD: Decimal = dec!(0.10); // Max allowed spread $0.10
 
             if sum_probabilities < Decimal::ONE {
                  // ARBITRAGE (Profit)
-                 log_json(LogEntry::arb(&group.condition_id, sum_probabilities, simulated_profit_usd));
+                 let entry = LogEntry::arb(&group.condition_id, sum_probabilities, simulated_profit_usd);
+                 log_json_with_file(&entry);
+
+                 if LIVE_TRADING_ENABLED {
+                    log_json(LogEntry::info(">>> EXECUTING ARBITRAGE BATCH <<<"));
+                    if let Err(e) = execute_arbitrage_batch(client, group).await {
+                         log_json(LogEntry::error("Execution Failed", e));
+                    }
+                 } else {
+                    log_json(LogEntry::info("Trading Disabled (Simulation Mode)"));
+                 }
             } else {
                  // NEAR MISS (Loss if executed)
-                 log_json(LogEntry::near_miss(&group.condition_id, sum_probabilities, simulated_profit_usd));
+                 let entry = LogEntry::near_miss(&group.condition_id, sum_probabilities, simulated_profit_usd);
+                 log_json_with_file(&entry);
             }
         } else {
             // Log efficient markets too for visibility (USER REQUEST)
@@ -322,8 +375,86 @@ fn group_markets(markets: Vec<MarketResponse>) -> Vec<MarketGroup> {
     groups.into_values().collect()
 }
 
+
+async fn execute_arbitrage_batch(client: &Client<Authenticated<Normal>>, group: &MarketGroup) -> anyhow::Result<()> {
+    // Strategy: Buy MAX_SPEND of EACH outcome.
+    // If Sum < 1.0, Total Cost < MAX_SPEND * Outcomes.
+    // Payout = MAX_SPEND * Outcomes (since 1 share of winning outcome pays $1).
+    // Note: This logic assumes we buy EQUAL SIZE of every outcome.
+    
+    let size_to_buy = MAX_SPEND; // 5 shares of each
+
+    // Re-create signer for signing orders
+    let mut private_key = env::var(PRIVATE_KEY_VAR)?;
+    private_key = private_key.trim().trim_matches('\"').trim_matches('\'').to_string();
+    if private_key.starts_with("0x") { private_key = private_key[2..].to_string(); }
+    let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
+
+    for outcome in &group.outcomes {
+        log_json(LogEntry::info(&format!("Placing order for {} ({} shares @ {})", outcome.name, size_to_buy, outcome.best_ask)));
+        
+        // Build Order
+        let order = client.limit_order()
+            .token_id(&outcome.token_id)
+            .side(Side::Buy)
+            .order_type(OrderType::GTC)
+            .price(outcome.best_ask)
+            .size(size_to_buy)
+            .build()
+            .await;
+
+        let order = match order {
+            Ok(o) => o,
+            Err(e) => {
+                log_json(LogEntry::error("Failed to build order", e));
+                continue;
+            }
+        };
+
+        // Sign & Post
+        let signed_result = client.sign(&signer, order).await;
+        match signed_result {
+            Ok(signed_order) => {
+                let post_result = client.post_order(signed_order).await;
+                match post_result {
+                    Ok(resp) => {
+                         if let Some(r) = resp.first() {
+                             log_json(LogEntry::info(&format!("Order Placed! ID: {}", r.order_id)));
+                         } else {
+                             log_json(LogEntry::info("Order Placed (No ID returned)"));
+                         }
+                    },
+                    Err(e) => log_json(LogEntry::error("Post Order Failed", e)),
+                }
+            },
+            Err(e) => log_json(LogEntry::error("Signing Failed", e)),
+        }
+    }
+
+    Ok(())
+}
+
+
 fn log_json(entry: LogEntry) {
     if let Ok(json) = serde_json::to_string(&entry) {
         println!("{}", json);
+    }
+}
+
+fn log_json_with_file(entry: &LogEntry) {
+    if let Ok(json) = serde_json::to_string(entry) {
+        println!("{}", json);
+        
+        // Append to file
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("opportunities.jsonl") 
+        {
+            if let Err(e) = writeln!(file, "{}", json) {
+                eprintln!("Failed to write to log file: {}", e);
+            }
+        }
     }
 }

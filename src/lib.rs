@@ -5,6 +5,7 @@ pub mod clob;
 pub mod error;
 #[cfg(feature = "gamma")]
 pub mod gamma;
+pub mod websocket;
 
 use alloy::primitives::{Address, ChainId, address};
 use phf::phf_map;
