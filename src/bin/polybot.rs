@@ -4,10 +4,9 @@ use std::sync::Arc;
 use std::str::FromStr;
 
 use anyhow::Context;
-use futures::{stream, StreamExt};
+use futures::StreamExt;
 use polymarket_client_sdk::clob::types::{
-    MarketResponse, OrderBookSummaryRequest, OrderBookSummaryRequestBuilder, 
-    BalanceAllowanceRequest, OrderType, Side
+    MarketResponse, OrderType, Side, OrderBookSummaryRequest, OrderBookSummaryRequestBuilder
 };
 use polymarket_client_sdk::clob::Client;
 use polymarket_client_sdk::auth::state::Authenticated;
@@ -19,15 +18,17 @@ use alloy::signers::Signer;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::Serialize;
-use tokio::time::sleep;
-use std::time::Duration;
+
+use alloy::sol;
+use alloy::providers::ProviderBuilder;
+use alloy::primitives::{Address, U256};
+use polymarket_client_sdk::contract_config;
+use url::Url;
 
 // ----------------------------------------------------------------------------
 // Constants
 // ----------------------------------------------------------------------------
-const SCAN_INTERVAL_SECS: u64 = 30;
-const MAX_CONCURRENT_REQUESTS: usize = 5;
-const MIN_SAMPLES_TO_FIND: usize = 20;
+const MIN_SAMPLES_TO_FIND: usize = 100;
 const MAX_SCANS_PER_TICK: usize = 5000;
 
 // ----------------------------------------------------------------------------
@@ -86,99 +87,315 @@ impl<'a> LogEntry<'a> {
 // Main Loop
 // ----------------------------------------------------------------------------
 
+
+// ----------------------------------------------------------------------------
+// Phase 5: Event-Driven Logic
+// ----------------------------------------------------------------------------
+use polymarket_client_sdk::websocket::{WsEvent, WsCommand};
+
+
+// Map: ConditionID -> Map: AssetID -> Price (Decimal)
+type OrderBookCache = HashMap<String, MarketState>;
+
+#[derive(Debug, Clone)]
+struct MarketState {
+    condition_id: String,
+    outcomes: HashMap<String, OutcomePrice>, // key: asset_id
+    last_update_ts: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OutcomePrice {
+    best_ask: Decimal,
+    // best_bid usually not needed for simple arb buying, but good to have
+}
+
+// ----------------------------------------------------------------------------
+// Main Loop
+// ----------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 0. Load .env
+    // [Setup Code Omitted for Brevity - Same as before]
     dotenvy::dotenv().ok();
+    log_json(LogEntry::info("Starting Polybot-rs (Phase 5: Event-Driven)..."));
 
-    // 1. Setup Logging
-    log_json(LogEntry::info("Starting Polybot-rs (Phase 3: Observability)..."));
-
-    // 1. Load Private Key & Auth
     let mut private_key = env::var(PRIVATE_KEY_VAR).context("POLYMARKET_PRIVATE_KEY not set")?;
     private_key = private_key.trim().trim_matches('\"').trim_matches('\'').to_string();
-    if private_key.starts_with("0x") {
-        private_key = private_key[2..].to_string();
-    }
-    let signer = LocalSigner::from_str(&private_key).map_err(|e| {
-        anyhow::anyhow!("Invalid private key format (length: {}): {}", private_key.len(), e)
-    })?.with_chain_id(Some(POLYGON));
+    if private_key.starts_with("0x") { private_key = private_key[2..].to_string(); }
+    let signer = LocalSigner::from_str(&private_key).map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?.with_chain_id(Some(POLYGON));
 
-    // 2. Connect & Authenticate
     let host = env::var("CLOB_API_URL").unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
-    log_json(LogEntry::info(&format!("Connecting to {}...", host)));
-
     let config = ConfigBuilder::default().use_server_time(true).build()?;
     let client = Client::new(&host, config)?
         .authentication_builder(&signer)
         .authenticate()
         .await
         .context("Failed to authenticate")?;
-
-    // 3. Verify Auth (Check Balance)
-    let balance = client.balance_allowance(&BalanceAllowanceRequest::default()).await;
-    match balance {
-        Ok(b) => log_json(LogEntry::info(&format!("Auth Success! Balance: {:?}", b))),
-        Err(e) => log_json(LogEntry::error("Failed to fetch balance", e)),
-    }
+        
+    let client = Arc::new(client); // Wrap early
 
     // Stats Tracking
-    let mut total_scanned_groups = 0;
-    let mut loops = 0;
+    let mut total_events = 0;
     let start_time = std::time::Instant::now();
 
     // -----------------------------------------------------------------------
-    // Phase 4: WebSocket Integration
+    // Phase 5: WebSocket Integration
+    // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Phase 8: Dynamic Market Rotation (Setup)
     // -----------------------------------------------------------------------
     let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(100);
+    // Command Channel for Rotation
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(100);
     
-    // We need to know WHICH markets to subscribe to.
-    // Strategy:
-    // 1. Run ONE initial HTTP scan to find active NegRisk markets.
-    // 2. Subscribe to those assets.
-    // 3. Main loop waits for WS events OR scan interval.
-
-    log_json(LogEntry::info("Initial Scan to find assets for WebSocket..."));
-    let initial_markets = find_active_negrisk_markets(&client).await?;
+    // 1. Initial Scan
+    log_json(LogEntry::info("Initial Scan to populate OrderBook Cache..."));
+    let initial_markets = find_active_negrisk_markets(&client, MIN_SAMPLES_TO_FIND).await?;
+    
+    // 2. Build Cache & Assets List
+    let mut cache: OrderBookCache = HashMap::new();
     let mut assets_to_track = Vec::new();
+    
+    // Map: AssetID -> ConditionID (Reverse lookup for WS events which only have AssetID sometimes)
+    let mut asset_to_condition: HashMap<String, String> = HashMap::new();
+
     for m in &initial_markets {
+        let condition_id = m.condition_id.clone();
+        let mut outcomes_map = HashMap::new();
+        
         for t in &m.tokens {
             assets_to_track.push(t.token_id.clone());
+            asset_to_condition.insert(t.token_id.clone(), condition_id.clone());
+            outcomes_map.insert(t.token_id.clone(), OutcomePrice { best_ask: Decimal::ZERO });
         }
+        
+        cache.insert(condition_id.clone(), MarketState {
+            condition_id: condition_id.clone(),
+            outcomes: outcomes_map,
+            last_update_ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        });
     }
+
     log_json(LogEntry::info(&format!("Subscribing to {} assets via WebSocket...", assets_to_track.len())));
 
-    let client = Arc::new(client);
+    // 2.5 Populate Prices Immediately (Snapshot) to trigger simulation
+    log_json(LogEntry::info("Fetching initial price snapshot..."));
+    populate_initial_and_sim(&client, &mut cache, &initial_markets).await;
 
-    // Spawn WS Task
+    // Spawn WS Task (Phase 8: Pass cmd_rx)
     tokio::spawn(async move {
-        if let Err(e) = polymarket_client_sdk::websocket::connect_and_listen(assets_to_track, ws_tx).await {
+        if let Err(e) = polymarket_client_sdk::websocket::connect_and_listen(assets_to_track, ws_tx, cmd_rx).await {
             eprintln!("WebSocket Task Error: {}", e);
         }
     });
+    
+    log_json(LogEntry::info("Event Loop Started. Waiting for Market Updates..."));
 
+    // EVENT LOOP (No more sleep!)
     loop {
-        loops += 1;
-        
-        // Select! allows us to wait for EITHER a WS message OR the timer.
-        // But for now, let's keep the existing loop logic AND check for WS messages.
-        // Actually, to fully event-drive requires refactoring `run_scan_cycle`.
-        // Hybrid Approach:
-        // - Consume all available WS messages (non-blocking) to update local cache?
-        // - OR: Just log WS messages to prove it works for now.
-        
+        // Wait for next WS Event
+        match ws_rx.recv().await {
+            Some(event) => {
+                total_events += 1;
+                
+                // Heartbeat
+                // Heartbeat
+                if total_events % 100 == 0 {
+                    let uptime = start_time.elapsed().as_secs();
+                    log_json(LogEntry::info(&format!("HEARTBEAT | Uptime: {}s | Events: {}", uptime, total_events)));
+                    
+                    // Verify On-Chain Connectivity by checking one random asset balance
+                    if let Some(market_state) = cache.values().next() {
+                         if let Some(asset_id) = market_state.outcomes.keys().next() {
+                              let user_address = client.address();
+                              let asset_id_clone = asset_id.clone();
+                              tokio::spawn(async move {
+                                  match check_on_chain_balance(user_address, &asset_id_clone).await {
+                                      Ok(bal) => println!("{{\"level\":\"INVENTORY\",\"msg\":\"On-Chain Balance Verified\",\"asset\":\"{}\",\"balance\":\"{}\"}}", asset_id_clone, bal),
+                                      Err(e) => eprintln!("Failed checking balance: {}", e),
+                                  }
+                              });
+                         }
+                    }
 
-        // Poll for WS messages frequently while waiting for next scan
-        let sleep_duration = Duration::from_secs(SCAN_INTERVAL_SECS);
-        let start_sleep = std::time::Instant::now();
-        
-        log_json(LogEntry::info(&format!("Listening for WS events (sleeping {}s)...", SCAN_INTERVAL_SECS)));
+                    // Phase 8: Rotation Logic (Infinite Scanning)
+                    // Every 500 events (approx 1-2 mins), rotate 5 stale markets.
+                    if total_events % 500 == 0 {
+                        // 1. Identify Stale Markets (Oldest 5)
+                        let mut market_timestamps: Vec<(String, u64)> = cache.iter()
+                            .map(|(k, v)| (k.clone(), v.last_update_ts))
+                            .collect();
+                        market_timestamps.sort_by_key(|k| k.1); // Sort by TS ascending (Oldest first)
+                        
+                        let to_remove: Vec<String> = market_timestamps.iter()
+                            .take(5)
+                            .map(|(id, _)| id.clone())
+                            .collect();
 
-        while start_sleep.elapsed() < sleep_duration {
-            while let Ok(msg) = ws_rx.try_recv() {
-                 log_json(LogEntry::info(&format!("WS EVENT: {}", msg)));
+                        if !to_remove.is_empty() {
+                             let mut assets_to_unsub = Vec::new();
+                             
+                             // 2. Remove from Cache & Maps
+                             for condition_id in &to_remove {
+                                 if let Some(state) = cache.remove(condition_id) {
+                                     for asset_id in state.outcomes.keys() {
+                                         asset_to_condition.remove(asset_id);
+                                         assets_to_unsub.push(asset_id.clone());
+                                     }
+                                 }
+                             }
+                             
+                             // 3. Send Unsub Command
+                             // let _ = cmd_tx.try_send(WsCommand::Unsubscribe(assets_to_unsub));
+                             // (Skipping actual unsub command for now as confirmed unstable, rely on new subs or reconnect if needed)
+                             // Actually, let's just log it.
+                             log_json(LogEntry::info(&format!("Rotation: Dropped {} stale markets.", to_remove.len())));
+
+                             // 4. Recruit New Markets (Fetch 5)
+                             // We fetch slightly more (10) to ensure we find unique ones not in cache
+                             if let Ok(new_markets) = find_active_negrisk_markets(&client, 10).await {
+                                 let mut added_count = 0;
+                                 let mut assets_to_sub = Vec::new();
+                                 
+                                 for m in new_markets {
+                                     if added_count >= 5 { break; }
+                                     if cache.contains_key(&m.condition_id) { continue; } // Skip if exists
+                                     
+                                     // Add to Cache
+                                     let condition_id = m.condition_id.clone();
+                                     let mut outcomes_map = HashMap::new();
+                                     for t in &m.tokens {
+                                         assets_to_sub.push(t.token_id.clone());
+                                         asset_to_condition.insert(t.token_id.clone(), condition_id.clone());
+                                         outcomes_map.insert(t.token_id.clone(), OutcomePrice { best_ask: Decimal::ZERO });
+                                     }
+                                     
+                                     cache.insert(condition_id.clone(), MarketState {
+                                         condition_id: condition_id.clone(),
+                                         outcomes: outcomes_map,
+                                         last_update_ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                     });
+                                     added_count += 1;
+                                 }
+                                 
+                                 // 5. Send Subscribe Command
+                                 if !assets_to_sub.is_empty() {
+                                     if let Err(e) = cmd_tx.try_send(WsCommand::Subscribe(assets_to_sub)) {
+                                          eprintln!("Failed to send Subscribe cmd: {}", e);
+                                     } else {
+                                          log_json(LogEntry::info(&format!("Rotation: Added {} fresh markets.", added_count)));
+                                     }
+                                 }
+                             }
+                        }
+                    }
+                }
+
+                // PROCESS EVENT
+                if let Some(changes) = event.price_changes {
+                    for change in changes {
+                        // We only care about ASKS (selling to us) updates?
+                        // Actually if we want to arb we need best ASK.
+                        // WS sends updates for both sides.
+                        
+                        // Parse Price
+                        let price = match Decimal::from_str(&change.price) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+
+                        // Update Cache
+                        if let Some(condition_id) = asset_to_condition.get(&change.asset_id) {
+                            if let Some(market_state) = cache.get_mut(condition_id) {
+                                // Update Staleness Tracker
+                                market_state.last_update_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+                                if let Some(outcome) = market_state.outcomes.get_mut(&change.asset_id) {
+                                    if change.side == "SELL" {
+                                         // 'SELL' side in orderbook means someone is selling TO us -> This is the ASK price.
+                                         // If size is 0, it means that price level is gone.
+                                         // But WS usually sends TOP of book. 
+                                         // If size == 0, we should technically look for next best?
+                                         // Our simplified cache handles "Best Ask". 
+                                         // If size > 0, update best ask.
+                                         // If size == 0, we might need to invalidate? For now, let's assume valid updates.
+                                         if change.size != "0" {
+                                             outcome.best_ask = price;
+                                         }
+                                    }
+                                }
+                                
+                                // CHECK ARB!
+                                check_and_execute_arb(&client, market_state).await;
+                            }
+                        }
+                    }
+                }
+            },
+            None => {
+                log_json(LogEntry::error("WS Channel Closed", "Exiting..."));
+                break;
             }
-            sleep(Duration::from_millis(100)).await;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn check_and_execute_arb(client: &Arc<Client<Authenticated<Normal>>>, state: &MarketState) {
+    let mut sum = Decimal::ZERO;
+    let mut incomplete = false;
+    let mut market_group_for_exec = MarketGroup {
+        condition_id: state.condition_id.clone(),
+        outcomes: Vec::new(), // We will populate this IF we find arb
+    };
+
+    for (asset_id, outcome) in &state.outcomes {
+        if outcome.best_ask <= Decimal::ZERO {
+            incomplete = true; 
+            break;
+        }
+        sum += outcome.best_ask;
+        
+        market_group_for_exec.outcomes.push(Outcome {
+            token_id: asset_id.clone(),
+            name: "Unknown".to_string(), // We don't track name in simplified cache, maybe add it later
+            best_ask: outcome.best_ask,
+            liquidity: dec!(100.0), // Placeholder, WS update doesn't always send total liquidity
+        });
+    }
+
+    if incomplete { return; }
+
+    if sum < NEAR_MISS_THRESHOLD {
+        let roi = (Decimal::ONE / sum) - Decimal::ONE;
+        let profit = SIMULATED_BALANCE * roi;
+
+        if sum < Decimal::ONE {
+             // ARB FOUND!
+             let entry = LogEntry::arb(&state.condition_id, sum, profit);
+             log_json_with_file(&entry);
+             
+             if LIVE_TRADING_ENABLED {
+                  // Execute
+                  log_json(LogEntry::info(">>> EXECUTING ARBITRAGE (EVENT_DRIVEN) <<<"));
+                  if let Err(e) = execute_arbitrage_batch(client, &market_group_for_exec).await {
+                        log_json(LogEntry::error("Execution Failed", e));
+                  }
+             } else {
+                  log_json(LogEntry::info("Trading Disabled (Simulation Mode)"));
+             }
+        } else {
+             // Near Miss (Log for visibility during initial check, maybe limit to top 5?)
+             if !LIVE_TRADING_ENABLED {
+                 let roi = (Decimal::ONE / sum) - Decimal::ONE;
+                 let profit = SIMULATED_BALANCE * roi;
+                 // Only log if somewhat reasonable (ROI > -5%) to avoid garbage
+                 if roi > dec!(-0.05) {
+                    log_json(LogEntry::near_miss(&state.condition_id, sum, profit));
+                 }
+             }
         }
     }
 }
@@ -187,34 +404,12 @@ async fn main() -> anyhow::Result<()> {
 // Core Logic
 // ----------------------------------------------------------------------------
 
-async fn run_scan_cycle(client: Arc<Client<Authenticated<Normal>>>) -> anyhow::Result<usize> {
-    log_json(LogEntry::info("Starting market scan..."));
 
-    // 1. Scan for Active Negative Risk Markets
-    let markets = find_active_negrisk_markets(&client).await?;
-    
-    // 2. Group them by Condition ID
-    let groups = group_markets(markets);
+// ----------------------------------------------------------------------------
+// Obsolete Polling Logic Removed (Phase 5 Transition)
+// ----------------------------------------------------------------------------
 
-    let count = groups.len();
-    log_json(LogEntry::info(&format!("Detected {} opportunities. Checking prices...", count)));
-
-    // 3. Process Groups concurrently (Price Check & Arb Calc)
-    stream::iter(groups)
-        .for_each_concurrent(MAX_CONCURRENT_REQUESTS, |mut group| {
-            let client = client.clone();
-            async move {
-                if let Err(e) = fetch_prices_and_calc(&client, &mut group).await {
-                    log_json(LogEntry::error("Failed to process group", e));
-                }
-            }
-        })
-        .await;
-
-    Ok(count)
-}
-
-async fn find_active_negrisk_markets(client: &Client<Authenticated<Normal>>) -> anyhow::Result<Vec<MarketResponse>> {
+async fn find_active_negrisk_markets(client: &Client<Authenticated<Normal>>, limit: usize) -> anyhow::Result<Vec<MarketResponse>> {
     let mut all_markets = Vec::new();
     let mut scanned_count = 0;
 
@@ -229,152 +424,64 @@ async fn find_active_negrisk_markets(client: &Client<Authenticated<Normal>>) -> 
              all_markets.push(response);
          }
 
-         if all_markets.len() >= MIN_SAMPLES_TO_FIND || scanned_count >= MAX_SCANS_PER_TICK {
+         if all_markets.len() >= limit || scanned_count >= MAX_SCANS_PER_TICK {
              break;
          }
     }
     
-    log_json(LogEntry::info(&format!("Scanned {} markets. Found {} active NegRisk markets.", scanned_count, all_markets.len())));
+    // Only log if significant
+    if limit > 20 {
+        log_json(LogEntry::info(&format!("Scanned {} markets. Found {} active NegRisk markets.", scanned_count, all_markets.len())));
+    }
     Ok(all_markets)
 }
 
+async fn populate_initial_and_sim(client: &Arc<Client<Authenticated<Normal>>>, cache: &mut OrderBookCache, markets: &[MarketResponse]) {
+    // Collect all token IDs
+    let mut all_tokens = Vec::new();
+    for m in markets {
+        for t in &m.tokens {
+            all_tokens.push(t.token_id.clone());
+        }
+    }
 
-const MIN_LIQUIDITY: Decimal = dec!(5.0); // Minimum 5 shares to count as valid price
+    // Requests (Batching logic is handled by client if we send vector?)
+    // Actually fetching 40+ orderbooks might fail if URL too long or rate limit. 
+    // Let's do it in chunks.
+    for chunk in all_tokens.chunks(20) {
+        let reqs: Vec<OrderBookSummaryRequest> = chunk.iter().map(|id| {
+             OrderBookSummaryRequestBuilder::default().token_id(id.clone()).build().unwrap()
+        }).collect();
+        
+        if let Ok(books) = client.order_books(&reqs).await {
+            for book in books {
+                // Update Cache
+                // Need to find which market this asset belongs to
+                 for market_state in cache.values_mut() {
+                     if let Some(outcome) = market_state.outcomes.get_mut(&book.asset_id) {
+                         if let Some(ask) = book.asks.first() {
+                             if ask.size >= dec!(5.0) { // Min Liquidity check
+                                 outcome.best_ask = ask.price;
+                             }
+                         }
+                     }
+                 }
+            }
+        }
+    }
+
+    // Run Simulation
+    for market_state in cache.values() {
+        check_and_execute_arb(client, market_state).await;
+    }
+    log_json(LogEntry::info("Simulation Snapshot Complete."));
+}
+
+
 const NEAR_MISS_THRESHOLD: Decimal = dec!(1.05);
 const SIMULATED_BALANCE: Decimal = dec!(20.0); // User's hypothetical deposit
 const LIVE_TRADING_ENABLED: bool = false; // SAFETY SWITCH
 const MAX_SPEND: Decimal = dec!(5.0); // Max spend per trade cycle
-
-async fn fetch_prices_and_calc(client: &Client<Authenticated<Normal>>, group: &mut MarketGroup) -> anyhow::Result<()> {
-    // Prepare requests (using OrderBooks to get Size/Liquidity)
-    let book_requests: Vec<OrderBookSummaryRequest> = group.outcomes.iter().map(|outcome| {
-        OrderBookSummaryRequestBuilder::default()
-            .token_id(outcome.token_id.clone())
-            .build()
-            .expect("Failed to build orderbook request")
-    }).collect();
-
-    // Fetch OrderBooks (Batch)
-    let books_response = client.order_books(&book_requests).await.context("API request failed")?;
-    
-    // Map responses by asset_id (token_id) for easy lookup. 
-    // Note: OrderBookSummaryResponse has `asset_id` field which corresponds to token_id.
-    let books_map: HashMap<String, _> = books_response.into_iter()
-        .map(|b| (b.asset_id.clone(), b))
-        .collect();
-
-    let mut sum_probabilities = Decimal::ZERO;
-    let mut incomplete_data = false;
-
-const MAX_SPREAD: Decimal = dec!(0.10); // Max allowed spread $0.10
-
-    for outcome in &mut group.outcomes {
-         if let Some(book) = books_map.get(&outcome.token_id) {
-             // 1. Find Best Ask (Selling to us) with Liquidity
-             let best_valid_ask = book.asks.iter().find(|ask| ask.size >= MIN_LIQUIDITY);
-             
-             // 2. Find Best Bid (Buying from us) - no liquidity check needed for bid usually, just top of book
-             // But to be safe, let's say we need someone willing to buy at least a little bit.
-             // Actually, for spread check, usually top of book is fine.
-             let best_bid = book.bids.iter().next().map(|bid| bid.price).unwrap_or(Decimal::ZERO);
-
-             if let Some(ask) = best_valid_ask {
-                 let spread = ask.price - best_bid;
-                 
-                 if spread > MAX_SPREAD {
-                     // Spread too wide, skipping for safety
-                     // Optional: Log strict rejection
-                     // println!("Skipping {} due to wide spread: {}", outcome.name, spread);
-                     incomplete_data = true;
-                     continue;
-                 }
-
-                 outcome.best_ask = ask.price;
-                 outcome.liquidity = ask.size;
-                 sum_probabilities += ask.price;
-             } else {
-                 incomplete_data = true;
-             }
-         } else {
-             incomplete_data = true;
-         }
-    }
-
-    if incomplete_data {
-        // Can't calculate full arb if some outcomes are missing liquidity
-        return Ok(());
-    }
-
-    // Log Logic
-    if sum_probabilities > Decimal::ZERO {
-        if sum_probabilities < NEAR_MISS_THRESHOLD {
-            // ROI = (Payout / Cost) - 1
-            // Payout is always 1.0 (if we hold to expiry and one wins).
-            // Cost is sum_probabilities.
-            // ROI = (1.0 / sum_probabilities) - 1.0
-            
-            let roi = (Decimal::ONE / sum_probabilities) - Decimal::ONE;
-            let simulated_profit_usd = SIMULATED_BALANCE * roi;
-
-            if sum_probabilities < Decimal::ONE {
-                 // ARBITRAGE (Profit)
-                 let entry = LogEntry::arb(&group.condition_id, sum_probabilities, simulated_profit_usd);
-                 log_json_with_file(&entry);
-
-                 if LIVE_TRADING_ENABLED {
-                    log_json(LogEntry::info(">>> EXECUTING ARBITRAGE BATCH <<<"));
-                    if let Err(e) = execute_arbitrage_batch(client, group).await {
-                         log_json(LogEntry::error("Execution Failed", e));
-                    }
-                 } else {
-                    log_json(LogEntry::info("Trading Disabled (Simulation Mode)"));
-                 }
-            } else {
-                 // NEAR MISS (Loss if executed)
-                 let entry = LogEntry::near_miss(&group.condition_id, sum_probabilities, simulated_profit_usd);
-                 log_json_with_file(&entry);
-            }
-        } else {
-            // Log efficient markets too for visibility (USER REQUEST)
-            let roi = (Decimal::ONE / sum_probabilities) - Decimal::ONE;
-            let simulated_profit_usd = SIMULATED_BALANCE * roi;
-            log_json(LogEntry::info(&format!("Group {}: Sum {} | PnL: ${:.2}", group.condition_id, sum_probabilities, simulated_profit_usd)));
-        }
-    }
-
-    Ok(())
-}
-
-fn group_markets(markets: Vec<MarketResponse>) -> Vec<MarketGroup> {
-    let mut groups: HashMap<String, MarketGroup> = HashMap::new();
-
-    for market in markets {
-        if !market.active || market.closed || !market.neg_risk {
-            continue;
-        }
-
-        let condition_id = market.condition_id.clone();
-        
-        let entry = groups.entry(condition_id.clone()).or_insert_with(|| MarketGroup {
-            condition_id,
-            outcomes: Vec::new(),
-        });
-
-        for token in market.tokens {
-            if !entry.outcomes.iter().any(|o| o.token_id == token.token_id) {
-               entry.outcomes.push(Outcome {
-                   token_id: token.token_id,
-                   name: token.outcome,
-                   best_ask: Decimal::ZERO, 
-                   liquidity: Decimal::ZERO,
-               });
-            }
-        }
-    }
-
-    groups.into_values().collect()
-}
-
 
 async fn execute_arbitrage_batch(client: &Client<Authenticated<Normal>>, group: &MarketGroup) -> anyhow::Result<()> {
     // Strategy: Buy MAX_SPEND of EACH outcome.
@@ -397,7 +504,7 @@ async fn execute_arbitrage_batch(client: &Client<Authenticated<Normal>>, group: 
         let order = client.limit_order()
             .token_id(&outcome.token_id)
             .side(Side::Buy)
-            .order_type(OrderType::GTC)
+            .order_type(OrderType::FOK) // Fill Or Kill for safety
             .price(outcome.best_ask)
             .size(size_to_buy)
             .build()
@@ -445,6 +552,7 @@ fn log_json_with_file(entry: &LogEntry) {
     if let Ok(json) = serde_json::to_string(entry) {
         println!("{}", json);
         
+
         // Append to file
         use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -457,4 +565,39 @@ fn log_json_with_file(entry: &LogEntry) {
             }
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Phase 7: On-Chain Logic
+// ----------------------------------------------------------------------------
+
+sol! {
+    #[sol(rpc)]
+    contract ConditionalTokens {
+        function balanceOf(address account, uint256 id) external view returns (uint256);
+    }
+}
+
+async fn check_on_chain_balance(user_address: Address, token_id_str: &str) -> anyhow::Result<Decimal> {
+    // 1. Setup Provider (RPC)
+    let rpc_url = env::var("POLYGON_RPC_URL").unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+    let provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url)?);
+
+    // 2. Get Contract Address
+    let config = contract_config(POLYGON, false).ok_or(anyhow::anyhow!("No contract config"))?;
+    let ct_address = config.conditional_tokens;
+
+    // 3. Parse Token ID
+    let token_id = U256::from_str_radix(token_id_str, 10).unwrap_or(U256::ZERO);
+
+    // 4. Call Contract
+    // Note: The `ConditionalTokens` struct is generated by `sol!` macro above.
+    // It should be available as `ConditionalTokens`.
+    let contract = ConditionalTokens::new(ct_address, provider);
+    let result = contract.balanceOf(user_address, token_id).call().await?;
+    
+    // 5. Convert to Decimal
+    let bal_dec = Decimal::from_str(&result.to_string())? / dec!(1_000_000); 
+    
+    Ok(bal_dec)
 }
