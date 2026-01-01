@@ -1,0 +1,47 @@
+High Impact, Low Effort
+
+1. Discord/Telegram Alerts 🔔
+What: Get a phone notification the instant an arbitrage is executed.
+Why: You don't have to stare at logs. Sleep peacefully knowing the bot will ping you.
+Effort: ~30 lines of code (HTTP POST to webhook).
+
+2. Auto-Settle Winning Positions 💰
+What: When a market resolves (e.g., "Trump Wins"), the bot automatically claims your winnings.
+Why: Currently, you have to manually redeem. This closes the loop.
+Effort: Medium. Requires monitoring resolved markets + calling redeemPositions on-chain.
+
+3. Profit Dashboard (TUI/Web) 📈
+What: A simple terminal UI (using ratatui) or web page showing:
+Total Profit/Loss
+Open Positions
+Recent Trades
+Why: Visualization makes it feel real. Also great for screenshots!
+Effort: Medium (TUI is faster than building a web frontend).
+
+🥈 Medium Impact, Medium Effort
+
+4. Cross-DEX Arbitrage 🌉
+What: Compare Polymarket prices against other prediction markets (Kalshi, Manifold, etc.).
+Why: Sometimes Polymarket has "Trump @ $0.48" while Kalshi has "Trump @ $0.52". Free money.
+Effort: High (Need to integrate other APIs, handle different settlement mechanics).
+
+5. Smart Position Sizing 🧮
+What: Instead of fixed MAX_SPEND, dynamically size based on:
+Confidence (how far below 1.0 is the sum?)
+Liquidity (can you actually fill?)
+Kelly Criterion (optimal bet sizing)
+Why: Maximize edge, minimize risk of ruin.
+Effort: Medium (Math is well-documented online).
+
+6. Rate Limit Handling & Backoff 🛡️
+What: If Polymarket API returns 429 (Too Many Requests), gracefully sleep and retry.
+Why: Prevents bot crashes during high-volume events (Election Night).
+Effort: Low (Add exponential backoff wrapper).
+
+🥉 Nice-to-Have (Future)
+7. Historical Backtest Engine 📜
+Store all events to a database. Replay them to test new strategies.
+8. Multi-Chain Support ⛓️
+Polymarket is on Polygon. Manifold is off-chain. Kalshi is fiat. Unify them.
+9. Mobile Companion App (Flutter/React Native) 📱
+Control your swarm from your phone.

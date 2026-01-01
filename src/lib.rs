@@ -6,6 +6,10 @@ pub mod error;
 #[cfg(feature = "gamma")]
 pub mod gamma;
 pub mod websocket;
+pub mod discord;
+pub mod tui;
+
+
 
 use alloy::primitives::{Address, ChainId, address};
 use phf::phf_map;

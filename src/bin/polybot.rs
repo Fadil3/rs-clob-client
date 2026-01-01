@@ -24,6 +24,10 @@ use alloy::providers::ProviderBuilder;
 use alloy::primitives::{Address, U256};
 use polymarket_client_sdk::contract_config;
 use url::Url;
+use std::sync::{Arc, Mutex, OnceLock};
+use polymarket_client_sdk::tui::{AppState, run_tui};
+
+static APP_STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
 
 // ----------------------------------------------------------------------------
 // Constants
@@ -92,6 +96,7 @@ impl<'a> LogEntry<'a> {
 // Phase 5: Event-Driven Logic
 // ----------------------------------------------------------------------------
 use polymarket_client_sdk::websocket::{WsEvent, WsCommand};
+use polymarket_client_sdk::discord::{send_alert, format_arb_alert};
 
 
 // Map: ConditionID -> Map: AssetID -> Price (Decimal)
@@ -117,7 +122,32 @@ struct OutcomePrice {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // [Setup Code Omitted for Brevity - Same as before]
-    dotenvy::dotenv().ok();
+    if let Ok(file) = env::var("ENV_FILE") {
+        if dotenvy::from_filename(&file).is_err() {
+             eprintln!("Warning: Could not load {}", file);
+        } else {
+             // println!("Loaded config from {}", file); // Redirected to TUI log if active? No, TUI not active yet.
+        }
+    } else {
+        dotenvy::dotenv().ok();
+    }
+
+    // TUI Initialization
+    let tui_enabled = env::var("TUI").is_ok();
+    if tui_enabled {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        APP_STATE.set(state.clone()).ok();
+        
+        // Spawn TUI Task
+        let (kill_tx, kill_rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Err(e) = run_tui(state, kill_rx).await {
+                eprintln!("TUI Error: {}", e);
+            }
+            std::process::exit(0);
+        });
+    }
+
     log_json(LogEntry::info("Starting Polybot-rs (Phase 5: Event-Driven)..."));
 
     let mut private_key = env::var(PRIVATE_KEY_VAR).context("POLYMARKET_PRIVATE_KEY not set")?;
@@ -135,6 +165,18 @@ async fn main() -> anyhow::Result<()> {
         
     let client = Arc::new(client); // Wrap early
 
+    // STARTUP BALANCE CHECK
+    let provider = ProviderBuilder::new().on_http(host.parse()?);
+    match provider.get_balance(signer.address()).await {
+        Ok(bal) => {
+            let bal_str = format!("{} (Wei)", bal);
+            log_json(LogEntry::info(&format!("MATIC Balance: {}", bal_str)));
+            if let Some(s) = APP_STATE.get() { s.lock().unwrap().balance = bal_str; }
+        },
+        Err(e) => log_json(LogEntry::error("Failed to check balance", anyhow::anyhow!(e))),
+    }
+
+
     // Stats Tracking
     let mut total_events = 0;
     let start_time = std::time::Instant::now();
@@ -142,6 +184,13 @@ async fn main() -> anyhow::Result<()> {
     // -----------------------------------------------------------------------
     // Phase 5: WebSocket Integration
     // -----------------------------------------------------------------------
+    if let Ok(shard) = env::var("SHARD_PREFIX") {
+        log_json(LogEntry::info(&format!("SWARM MODE ACTIVE: Shard Prefix = '{}'", shard)));
+        if let Some(s) = APP_STATE.get() { s.lock().unwrap().shard = shard; }
+    } else {
+        log_json(LogEntry::info("Running in Default Mode (No Sharding)"));
+    }
+
     // -----------------------------------------------------------------------
     // Phase 8: Dynamic Market Rotation (Setup)
     // -----------------------------------------------------------------------
@@ -202,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
                 // Heartbeat
                 // Heartbeat
                 if total_events % 100 == 0 {
+                    if let Some(s) = APP_STATE.get() { s.lock().unwrap().events_processed = total_events; }
                     let uptime = start_time.elapsed().as_secs();
                     log_json(LogEntry::info(&format!("HEARTBEAT | Uptime: {}s | Events: {}", uptime, total_events)));
                     
@@ -248,9 +298,19 @@ async fn main() -> anyhow::Result<()> {
                              
                              // 3. Send Unsub Command
                              // let _ = cmd_tx.try_send(WsCommand::Unsubscribe(assets_to_unsub));
-                             // (Skipping actual unsub command for now as confirmed unstable, rely on new subs or reconnect if needed)
-                             // Actually, let's just log it.
-                             log_json(LogEntry::info(&format!("Rotation: Dropped {} stale markets.", to_remove.len())));
+                             
+                             // 3.5 Opportunistic Redemption (Auto-Settle)
+                             // If a market is stale, maybe it resolved? Try to redeem!
+                             let signer_clone = signer.clone();
+                             for id in to_remove.clone() {
+                                 let s = signer_clone.clone();
+                                 tokio::spawn(async move {
+                                     // Fire and forget - if it fails (not resolved), we just lose dust gas
+                                     let _ = redeem_winnings(&s, &id).await; 
+                                 });
+                             }
+
+                             log_json(LogEntry::info(&format!("Rotation: Dropped {} stale markets (and tried redemption).", to_remove.len())));
 
                              // 4. Recruit New Markets (Fetch 5)
                              // We fetch slightly more (10) to ensure we find unique ones not in cache
@@ -377,6 +437,11 @@ async fn check_and_execute_arb(client: &Arc<Client<Authenticated<Normal>>>, stat
              let entry = LogEntry::arb(&state.condition_id, sum, profit);
              log_json_with_file(&entry);
              
+             // DISCORD ALERT
+             let link = format!("https://polymarket.com/market/{}", state.condition_id);
+             let alert_msg = format_arb_alert(&state.condition_id, profit.to_string(), sum.to_string(), &link);
+             send_alert(alert_msg);
+             
              if LIVE_TRADING_ENABLED {
                   // Execute
                   log_json(LogEntry::info(">>> EXECUTING ARBITRAGE (EVENT_DRIVEN) <<<"));
@@ -415,12 +480,17 @@ async fn find_active_negrisk_markets(client: &Client<Authenticated<Normal>>, lim
 
     // Use stream_data to automatically handle pagination for sampling_markets
     let mut stream = Box::pin(client.stream_data(|c, cursor| c.sampling_markets(cursor)));
-    
+    let shard_prefix = env::var("SHARD_PREFIX").ok();
+
     while let Some(response_result) = stream.next().await {
          let response = response_result.context("Failed to fetch markets")?;
          scanned_count += 1;
          
          if response.active && response.neg_risk && !response.closed {
+             // Shard Filter
+             if let Some(prefix) = &shard_prefix {
+                 if !response.condition_id.starts_with(prefix) { continue; }
+             }
              all_markets.push(response);
          }
 
@@ -481,7 +551,14 @@ async fn populate_initial_and_sim(client: &Arc<Client<Authenticated<Normal>>>, c
 const NEAR_MISS_THRESHOLD: Decimal = dec!(1.05);
 const SIMULATED_BALANCE: Decimal = dec!(20.0); // User's hypothetical deposit
 const LIVE_TRADING_ENABLED: bool = false; // SAFETY SWITCH
-const MAX_SPEND: Decimal = dec!(5.0); // Max spend per trade cycle
+fn get_max_spend() -> Decimal {
+    if let Ok(val_str) = env::var("MAX_SPEND") {
+        if let Ok(val) = Decimal::from_str(&val_str) {
+            return val;
+        }
+    }
+    dec!(5.0)
+}
 
 async fn execute_arbitrage_batch(client: &Client<Authenticated<Normal>>, group: &MarketGroup) -> anyhow::Result<()> {
     // Strategy: Buy MAX_SPEND of EACH outcome.
@@ -489,7 +566,7 @@ async fn execute_arbitrage_batch(client: &Client<Authenticated<Normal>>, group: 
     // Payout = MAX_SPEND * Outcomes (since 1 share of winning outcome pays $1).
     // Note: This logic assumes we buy EQUAL SIZE of every outcome.
     
-    let size_to_buy = MAX_SPEND; // 5 shares of each
+    let size_to_buy = get_max_spend(); // 5 shares of each
 
     // Re-create signer for signing orders
     let mut private_key = env::var(PRIVATE_KEY_VAR)?;
@@ -543,8 +620,14 @@ async fn execute_arbitrage_batch(client: &Client<Authenticated<Normal>>, group: 
 
 
 fn log_json(entry: LogEntry) {
-    if let Ok(json) = serde_json::to_string(&entry) {
-        println!("{}", json);
+    if let Some(state) = APP_STATE.get() {
+        if let Ok(mut s) = state.lock() {
+             s.add_log(entry.level.to_string(), entry.msg.to_string());
+        }
+    } else {
+        if let Ok(json) = serde_json::to_string(&entry) {
+            println!("{}", json);
+        }
     }
 }
 
@@ -575,6 +658,7 @@ sol! {
     #[sol(rpc)]
     contract ConditionalTokens {
         function balanceOf(address account, uint256 id) external view returns (uint256);
+        function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] calldata indexSets) external;
     }
 }
 
@@ -601,3 +685,44 @@ async fn check_on_chain_balance(user_address: Address, token_id_str: &str) -> an
     
     Ok(bal_dec)
 }
+
+async fn redeem_winnings(
+    signer: &LocalSigner,
+    condition_id_str: &str,
+) -> anyhow::Result<()> {
+    // 1. Setup Provider
+    let rpc_url = env::var("POLYGON_RPC_URL").unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+    let provider = ProviderBuilder::new()
+        .wallet(signer.clone())
+        .on_http(Url::parse(&rpc_url)?);
+
+    // 2. Config
+    let config = contract_config(POLYGON, false).ok_or(anyhow::anyhow!("No contract config"))?;
+    
+    // 3. Prepare Args
+    use alloy::primitives::FixedBytes;
+    let condition_id = FixedBytes::<32>::from_str(condition_id_str).map_err(|e| anyhow::anyhow!(e))?;
+    let parent_collection_id = FixedBytes::<32>::ZERO;
+    let index_sets = vec![U256::from(1), U256::from(2)]; // For binary markets
+
+    let contract = ConditionalTokens::new(config.conditional_tokens, provider);
+    
+    log_json(LogEntry::info(&format!("Attempting Redemption for {}", condition_id_str)));
+
+    // 4. Send Tx
+    let receipt = contract
+        .redeemPositions(config.collateral, parent_collection_id, condition_id, index_sets)
+        .send()
+        .await?
+        .watch()
+        .await?;
+
+    log_json(LogEntry::info(&format!("Redemption Success! Tx: {:?}", receipt)));
+    
+    // Discord Alert
+    let link = format!("https://polymarket.com/market/{}", condition_id_str);
+    send_alert(format!("🏆 **Winnings Claimed!**\nMarket: {}\n[View Transaction](https://polygonscan.com/tx/{:?})", condition_id_str, receipt));
+
+    Ok(())
+}
+
