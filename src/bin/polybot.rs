@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::str::FromStr;
 
 use anyhow::Context;
@@ -20,11 +20,10 @@ use rust_decimal_macros::dec;
 use serde::Serialize;
 
 use alloy::sol;
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::primitives::{Address, U256};
 use polymarket_client_sdk::contract_config;
 use url::Url;
-use std::sync::{Arc, Mutex, OnceLock};
 use polymarket_client_sdk::tui::{AppState, run_tui};
 
 static APP_STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
@@ -139,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
         APP_STATE.set(state.clone()).ok();
         
         // Spawn TUI Task
-        let (kill_tx, kill_rx) = tokio::sync::mpsc::channel(1);
+        let (_kill_tx, kill_rx) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
             if let Err(e) = run_tui(state, kill_rx).await {
                 eprintln!("TUI Error: {}", e);
@@ -166,14 +165,14 @@ async fn main() -> anyhow::Result<()> {
     let client = Arc::new(client); // Wrap early
 
     // STARTUP BALANCE CHECK
-    let provider = ProviderBuilder::new().on_http(host.parse()?);
+    let provider = ProviderBuilder::new().on_http(host.parse()?); // on_http is soft deprecated but works, or use connect_http
     match provider.get_balance(signer.address()).await {
         Ok(bal) => {
             let bal_str = format!("{} (Wei)", bal);
             log_json(LogEntry::info(&format!("MATIC Balance: {}", bal_str)));
             if let Some(s) = APP_STATE.get() { s.lock().unwrap().balance = bal_str; }
         },
-        Err(e) => log_json(LogEntry::error("Failed to check balance", anyhow::anyhow!(e))),
+        Err(e) => log_json(LogEntry::error("Failed to check balance", anyhow::anyhow!(e.to_string()))),
     }
 
 

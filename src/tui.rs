@@ -6,8 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     layout::{Layout, Constraint, Direction},
     Terminal,
-    style::{Style, Color, Modifier},
-    text::{Span, Line},
+    style::{Style, Color},
 };
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -110,7 +109,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     }
 }
 
-fn ui<B: ratatui::backend::Backend>(f: &mut ratatui::Frame, state: &Arc<Mutex<AppState>>) {
+fn ui(f: &mut ratatui::Frame, state: &Arc<Mutex<AppState>>) {
     let state = state.lock().unwrap();
 
     let chunks = Layout::default()
@@ -120,7 +119,7 @@ fn ui<B: ratatui::backend::Backend>(f: &mut ratatui::Frame, state: &Arc<Mutex<Ap
             Constraint::Min(10),    // Logs
             Constraint::Length(10), // Footer / Stats
         ].as_ref())
-        .split(f.size()); // Changed f.size() to f.area() in 0.29 but f.size() is deprecated, let's try f.area() or stick to size based on crate version. cargo.toml says 0.29. let's assume f.area() or use simple size() for now. Actually f.size() is correct for ratatui < 0.26 or something. 0.29 uses f.area() usually. I'll use f.area() to be safe or f.size() if compiler complains. I'll use f.size() as it is often aliased.
+        .split(f.area());
 
     // Header
     let header_text = format!(
